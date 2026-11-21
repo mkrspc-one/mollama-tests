@@ -5694,7 +5694,7 @@ describe('Linked devices', () => {
         const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
         expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toContain('Pooled hello');
         // Split by what the model needs (tiny here), on the fastest device first.
-        expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [0.8], ctx: 8192 }]);
+        expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [0.8], ctx: 16384 }]);
         expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
         expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
 
