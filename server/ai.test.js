@@ -6421,7 +6421,16 @@ describe('Tool servers', () => {
             expect(entry.does.length).toBeGreaterThan(10);
             if (entry.by === 'community') expect(entry.caution).toMatch(/community/);
             if (entry.args.includes('<')) expect(entry.needs.join(' ')).toMatch(/Replace </);
+            // What the page can check on the computer: the program it starts with and the app it works with; the
+            // checked needs and the folder step are not repeated among its own steps.
+            expect(['node', 'uv', 'docker', 'xcode', null]).toContain(entry.requires.program);
+            expect(entry.folder).toBe(entry.args.includes('<folder>'));
+            expect(entry.steps.join(' ')).not.toMatch(/has to be installed on this computer|^Replace <folder>/);
         }
+        const by = (name) => TOOL_LOCAL_CATALOGUE.find((entry) => entry.name === name);
+        expect(by('Blender').requires).toEqual({ program: 'uv', app: 'blender' });
+        expect(by('Memory').requires).toEqual({ program: 'node', app: null });
+        expect(by('Files on this computer')).toMatchObject({ folder: true, steps: [] });
     });
 
     test('every health state has a label, and every state but healthy says what is needed', () => {
