@@ -897,8 +897,9 @@ describe('Fit rules', () => {
         const big = { sizeMb: 15000, parameters: 24 };
         expect(fitModel(big, noCard).fits).toBe(false);
         expect(fitPool(big, [noCard, noCard])).toEqual({ fits: true, memoryMb: 12288 * 2, memoryNeededMb: memoryNeededMb(big) });
-        // A computer with a graphics card gives only its graphics memory to a pool.
-        expect(fitPool(big, [laptop, laptop]).fits).toBe(false);
+        // The computer that runs the model also gives its system memory for layers that do not fit graphics memory.
+        expect(fitPool(big, [laptop, laptop])).toMatchObject({ fits: true, memoryMb: 6656 * 2 + (32768 - 4096) });
+        expect(fitPool({ sizeMb: 60000, parameters: 70 }, [laptop, laptop]).fits).toBe(false);
         // One computer is not a pool, and a model that only runs online is never pooled.
         expect(fitPool(big, [workstation])).toBeNull();
         expect(fitPool({ ...big, cloudOnly: true }, [laptop, noCard])).toBeNull();
