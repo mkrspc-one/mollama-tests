@@ -6370,6 +6370,15 @@ describe('Tool servers', () => {
         expect(seal({ key: 'good-key' })).not.toBe(sealed);
     });
 
+    test('a skill that uses a tool server says so, and counts it as ready only once that server is ready on the account', async () => {
+        const skillOf = async () => (await client.get('/api/v1/skills', any)).data.skills.find((skill) => skill.id === 'context7-context7-mcp');
+        expect((await skillOf()).toolServers).toEqual([{ name: 'Context7', ready: false }]);
+        const added = await add({ name: 'Context7', address: 'https://mcp.context7.com/mcp' });
+        expect(added.data.server.health.state).toBe('healthy');
+        expect((await skillOf()).toolServers).toEqual([{ name: 'Context7', ready: true }]);
+        expect((await client.get('/api/v1/skills/context7-context7-mcp', any)).data.skill.toolServers).toEqual([{ name: 'Context7', ready: true }]);
+    });
+
     test('an app that lists its tools oddly is still added and checked, with only what can be kept', async () => {
         await testStartup.loginAsUser('user');
         const added = await add({ name: 'Odd app', address: 'https://odd.example/mcp' });
@@ -6658,6 +6667,13 @@ describe('Tool servers', () => {
             expect(checked.health.state).toBe('stopped');
             expect(checked.health.detail).toBe('The program uvx was not found.');
             expect(checked.tools.map((tool) => tool.name)).toEqual(['make_cube']);
+
+            // The tool server answers but the app it controls does not: its tools are kept, the reason shown, and it is
+            // not Ready, so chats do not offer tools that would fail.
+            reply = { state: 'waiting', detail: 'Blender did not answer. Open Blender and start its MCP server.', tools: [{ name: 'get_scene_info', description: 'Reads the scene', readOnly: true }] };
+            const waiting = (await client.post(`${api}/${added.id}/check`, {}, any)).data.server;
+            expect(waiting.health).toMatchObject({ state: 'waiting', label: 'App not open', detail: 'Blender did not answer. Open Blender and start its MCP server.' });
+            expect(waiting.tools.map((tool) => tool.name)).toEqual(['get_scene_info']);
             expect((await addLocal(id)).status).toBe(409);
         });
 
