@@ -10,7 +10,7 @@ import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
-    fitModel, fitPool, poolShareMb, rankCatalogue, memoryNeededMb, VERDICTS,
+    fitModel, fitPool, poolShareMb, splitBySpeed, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
@@ -902,6 +902,15 @@ describe('Fit rules', () => {
         // One computer is not a pool, and a model that only runs online is never pooled.
         expect(fitPool(big, [workstation])).toBeNull();
         expect(fitPool({ ...big, cloudOnly: true }, [laptop, noCard])).toBeNull();
+    });
+
+    test('a pooled model fills the fastest device first', () => {
+        const mac = { memoryMb: 18432, gpuMemoryMb: 12288, gpuShared: true };
+        const pc = { memoryMb: 32768, gpuMemoryMb: 8192 };
+        // Order is llama.cpp's: the lending Mac first, then the main computer's graphics card, which is faster and fills first.
+        expect(splitBySpeed([mac, pc], 15000)).toEqual([8.1, 6.5]);
+        // A model too big for both together is split by what each can give.
+        expect(splitBySpeed([mac, pc], 40000)).toEqual([10.5, 6.5]);
     });
 
     test('8 GB of graphics memory runs 7 to 9B models fully on the GPU', () => {
@@ -5683,7 +5692,8 @@ describe('Linked devices', () => {
         const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Hello pool' }, { responseType: 'text', validateStatus: () => true });
         const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
         expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toContain('Pooled hello');
-        expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [28], ctx: 8192 }]);
+        // Split by what the model needs (tiny here), on the fastest device first.
+        expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [0.8], ctx: 8192 }]);
         expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
         expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
 
