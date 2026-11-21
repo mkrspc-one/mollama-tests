@@ -5675,6 +5675,45 @@ describe('Linked devices', () => {
         await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
     });
 
+    test('a computer that changes network is grouped again at once, and a pool that is off says why', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address, extra = {}) => ({ addresses: [{ address, prefix: 24, interface: 'A9000_NETGEAR', wired: false, ...extra }] });
+        const pc = await link('move-pc');
+        const mac = await link('move-mac');
+        await fakeApp(pc.id, pc.key, { network: home('10.9.8.10') });
+        const macApp = await fakeApp(mac.id, mac.key, { network: home('10.9.8.20') });
+        const groupNow = async (want) => {
+            let pools = null;
+            for (let tries = 0; tries < 80; tries += 1) {
+                pools = (await client.get('/api/v1/devices/pools')).data;
+                if (Boolean(pools.groups.find((group) => group.network === '10.9.8.0/24')) === want) break;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return pools;
+        };
+        expect((await groupNow(true)).groups.some((group) => group.network === '10.9.8.0/24')).toBe(true);
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'main' });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'lend' });
+
+        // The Mac's network becomes Public: the pool goes, and the Mac is listed with the connection to set Private.
+        macApp.ws.send(JSON.stringify({ type: 'network', data: home('10.9.8.20', { category: 'public' }) }));
+        const apart = await groupNow(false);
+        expect(apart.left.find((one) => one.id === mac.id)).toMatchObject({ reason: 'public', publicNetworks: ['A9000_NETGEAR'] });
+        // A model that fits only pooled still says so, with the pool off and why.
+        const off = (await client.get(`/api/v1/devices/${pc.id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
+        expect(off.length).toBeGreaterThan(0);
+        expect(off[0].pool).toMatchObject({ main: 'move-pc', here: true });
+        expect(off[0].pool.off).toMatch(/move.mac: Windows marks its network as Public/);
+
+        // Back to Private: grouped again, and the pool is on.
+        macApp.ws.send(JSON.stringify({ type: 'network', data: home('10.9.8.20', { category: 'private' }) }));
+        await groupNow(true);
+        const on = (await client.get(`/api/v1/devices/${pc.id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
+        expect(on[0].pool.off).toBeUndefined();
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
+    });
+
     test('a lending computer on another llama.cpp build than the main computer is told why it cannot pool', async () => {
         await testStartup.loginAsUser('admin');
         const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Wi-Fi', wired: false }] });
