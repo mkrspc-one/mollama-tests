@@ -6677,13 +6677,13 @@ describe('Tool servers', () => {
             expect((await addLocal(id)).status).toBe(409);
         });
 
-        test('a desktop app too old to answer is reported as needing an update', async () => {
+        test('a desktop app that does not answer a check in time is reported as such', async () => {
             const { id, key } = await link();
             await fakeApp(id, key, () => null);
             const usual = deviceGateway.askMs;
             deviceGateway.askMs = 200;
             try {
-                expect((await addLocal(id)).data.server.health.state).toBe('outdated');
+                expect((await addLocal(id)).data.server.health).toMatchObject({ state: 'outdated', label: 'No answer in time' });
             } finally {
                 deviceGateway.askMs = usual;
             }
