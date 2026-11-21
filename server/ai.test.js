@@ -2442,7 +2442,6 @@ describe('Chat endpoints', () => {
                 expect((await patch(`/chats/${chat.id}`, { title: 'Taken' })).status).toBe(404);
                 expect((await send(chat.id, { content: 'hello' })).response.status).toBe(404);
                 expect((await send(chat.id, { regenerate: true })).response.status).toBe(404);
-                expect((await post(`/chats/${chat.id}/summary`, {})).status).toBe(404);
                 expect((await upload(chat.id, 'a.txt', Buffer.from('text'))).status).toBe(404);
                 expect((await get(`/chats/${chat.id}/export?format=markdown`)).status).toBe(404);
                 expect((await remove(`/chats/${chat.id}`)).status).toBe(404);
@@ -3341,27 +3340,6 @@ describe('Chat endpoints', () => {
             expect((await get(`/chats/${chat.id}/export?format=pdf`)).status).toBe(400);
         });
 
-        test('starts a new chat from a summary', async () => {
-            const chat = await newChat({ model: 'qwen2.5-coder:7b', system: 'Be brief.' });
-            await send(chat.id, { content: 'We plan a harbour survey.' });
-            state.chatReply = '- Goal: harbour survey';
-            const response = await post(`/chats/${chat.id}/summary`, {});
-
-            expect(response.status).toBe(201);
-            expect(response.data.chat).toMatchObject({
-                summary: '- Goal: harbour survey', continuedFrom: chat.id, model: 'qwen2.5-coder:7b', system: 'Be brief.', messages: []
-            });
-            expect(response.data.chat.title).toMatch(/\(continued\)$/);
-            expect(state.chatCalls[1].stream).toBe(false);
-
-            await send(response.data.chat.id, { content: 'What was the goal?' });
-            expect(state.chatCalls[2].messages[0].content).toContain('Summary of the earlier conversation:\n- Goal: harbour survey');
-        });
-
-        test('an empty chat cannot be summarised', async () => {
-            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-            expect((await post(`/chats/${chat.id}/summary`, {})).status).toBe(400);
-        });
     });
 
     // The components the chat can draw and the attributes it accepts for each, as in the web app's own list.
@@ -3538,14 +3516,12 @@ describe('Chat endpoints', () => {
             expect((await post('/chats', { instructions: [{ name: 'A', text: 'x', source: 'elsewhere' }] })).status).toBe(400);
         });
 
-        test('a new chat from a summary and an export both carry the articles', async () => {
+        test('an export carries the articles', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [tone, brief] });
             await send(chat.id, { content: 'hello' });
             const exported = (await get(`/chats/${chat.id}/export?format=markdown`)).data.content;
             expect(exported).toContain('# Tone');
             expect(exported).toContain('harbour survey by June');
-            const next = (await post(`/chats/${chat.id}/summary`, {})).data.chat;
-            expect(next.instructions.map((item) => item.name)).toEqual(['Tone', 'brief.md']);
         });
     });
 
@@ -3768,6 +3744,38 @@ describe('Chat endpoints', () => {
         });
         const search = ['web_search', { query: 'duck 3d model' }];
         const fetchPage = ['web_fetch', { url: 'https://models.example/duck' }];
+
+        test('a chat too long to send is compressed in place and carries on, instead of being refused', async () => {
+            const usual = state.contextLength;
+            state.contextLength = 4096;
+            state.memoryCalls = [];
+            state.memoryReply = '- The user is planning a duck pond.';
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                // Thirty messages already in the chat: far more than the model can read at once.
+                const long = (n) => `${n} ${'word '.repeat(120)}`;
+                const earlier = Array.from({ length: 30 }, (_, n) => ({ role: n % 2 === 0 ? 'user' : 'assistant', content: long(n), model: 'qwen2.5-coder:7b' }));
+                await Chat.updateOne({ _id: chat.id }, { $set: { messages: earlier } });
+                state.chatCalls.length = 0;
+                const { response, events } = await send(chat.id, { content: 'What size is the pond?' });
+                expect(response.status).toBe(200);
+                expect(events.some((event) => event.type === 'error')).toBe(false);
+                // The older messages became the memory, by the chat's own model, before the message was sent (the usual fold after
+                // the reply may add to it).
+                expect(state.memoryCalls.length).toBeGreaterThanOrEqual(1);
+                const sent = state.chatCalls.at(-1).messages;
+                expect(sent[0].content).toContain(state.memoryReply);
+                expect(sent.at(-1).content).toBe('What size is the pond?');
+                const saved = await Chat.findById(chat.id);
+                expect(saved.memory).toBe(state.memoryReply);
+                expect(saved.memoryThrough).toBeGreaterThan(0);
+                // The person still sees every message, with the reply after them.
+                expect(saved.messages).toHaveLength(32);
+            } finally {
+                state.contextLength = usual;
+                state.memoryReply = null;
+            }
+        });
 
         test('a long chat folds its older messages into a memory, sends the memory and the recent messages, and drops it when an edit reaches back', async () => {
             const usual = state.contextLength;
@@ -5643,6 +5651,28 @@ describe('Linked devices', () => {
         expect(await ordered(pcApp, { role: 'lend', bind: null, allow: [] })).toEqual({ role: 'lend', bind: null, allow: [] });
         await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
         await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
+    });
+
+    test('a model that fits only pooled names the main computer it is downloaded to', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Ethernet', wired: true }] });
+        const pc = await link('fetch-pc');
+        const mac = await link('fetch-mac');
+        await fakeApp(pc.id, pc.key, { network: home('10.9.7.10') });
+        await fakeApp(mac.id, mac.key, { network: home('10.9.7.20') });
+        for (let tries = 0; tries < 60; tries += 1) {
+            if ((await client.get('/api/v1/devices/pools')).data.groups.some((group) => group.network === '10.9.7.0/24' && group.computers.length === 2)) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const pooledIn = async (id) => (await client.get(`/api/v1/devices/${id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
+        // Before a main computer is chosen, either one may take the download.
+        const before = await pooledIn(pc.id);
+        expect(before.length).toBeGreaterThan(0);
+        expect(before[0].pool).toMatchObject({ main: null, here: true });
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'main' });
+        expect((await pooledIn(pc.id))[0].pool).toMatchObject({ main: 'fetch-pc', here: true });
+        expect((await pooledIn(mac.id))[0].pool).toMatchObject({ main: 'fetch-pc', here: false });
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
     });
 
     test('a lending computer on another llama.cpp build than the main computer is told why it cannot pool', async () => {
