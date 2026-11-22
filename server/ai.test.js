@@ -901,6 +901,12 @@ describe('Fit rules', () => {
         // The computer that runs the model also gives its system memory for layers that do not fit graphics memory.
         expect(fitPool(big, [laptop, laptop])).toMatchObject({ fits: true, memoryMb: 6656 * 2 + (32768 - 4096) });
         expect(fitPool({ sizeMb: 60000, parameters: 70 }, [laptop, laptop]).fits).toBe(false);
+        // Only the computer chosen to run the model adds system memory: a Mac (its memory is its graphics) running a 20 GB
+        // model with a laptop lending has too little, and the laptop running it has enough.
+        const mac = { memoryMb: 18432, gpuMemoryMb: 12288, gpuShared: true };
+        const r1 = { sizeMb: 19000, parameters: 32 };
+        expect(fitPool(r1, [{ ...mac, runs: true }, laptop])).toMatchObject({ fits: false, memoryMb: (12288 - 1536) + 6656 });
+        expect(fitPool(r1, [mac, { ...laptop, runs: true }])).toMatchObject({ fits: true, memoryMb: (12288 - 1536) + 6656 + (32768 - 4096) });
         // One computer is not a pool, and a model that only runs online is never pooled.
         expect(fitPool(big, [workstation])).toBeNull();
         expect(fitPool({ ...big, cloudOnly: true }, [laptop, noCard])).toBeNull();
