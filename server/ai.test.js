@@ -5562,7 +5562,7 @@ describe('Linked devices', () => {
             }
             if (message.type === 'request' && message.via === 'pool') {
                 app.pooled.push({ path: message.path, body: JSON.parse(message.body || '{}') });
-                if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN', detail: 'The pooled model stopped: the lending computer at 10.9.4.20 could not be reached for 45 seconds.' });
+                if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN', detail: 'The pooled model stopped: the secondary computer at 10.9.4.20 could not be reached for 45 seconds.' });
                 send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'text/event-stream' } });
                 for (const piece of ['Pooled ', 'hello']) send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: piece } }] })}\n\n`).toString('base64') });
                 send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n`).toString('base64') });
@@ -5852,7 +5852,7 @@ describe('Linked devices', () => {
         mainApp.poolDown = true;
         const dropped = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Still there?' }, { responseType: 'text', validateStatus: () => true });
         const failed = String(dropped.data).trim().split('\n').map((line) => JSON.parse(line)).find((event) => event.type === 'error');
-        expect(failed).toMatchObject({ code: 'POOL_STOPPED', detail: 'The pooled model stopped: the lending computer at 10.9.4.20 could not be reached for 45 seconds.' });
+        expect(failed).toMatchObject({ code: 'POOL_STOPPED', detail: 'The pooled model stopped: the secondary computer at 10.9.4.20 could not be reached for 45 seconds.' });
         expect(failed.message).toMatch(/stopped answering/);
 
         // A pool that cannot start says what the computer that runs the model said, in the reply and once saved.
