@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -2947,6 +2947,44 @@ describe('Chat endpoints', () => {
             client.clearCookies();
             client.authenticatedAs = null;
             expect((await get('/activity')).status).toBe(401);
+        });
+
+        test('a reply being written when the server stops is kept as far as it got, and one left as a draft is recovered', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            try {
+                const stream = await openStream(chat.id, { content: 'count for me' });
+                await stream.until((event) => event.type === 'token');
+                await post(`/chats/${chat.id}/messages`, { content: 'and again' });
+                await stopReplies();
+                await stream.finished;
+            } finally {
+                state.chatHold = false;
+            }
+            const kept = (await get(`/chats/${chat.id}`)).data.chat;
+            // The message that was waiting its turn is not started, and the reply says why it is incomplete.
+            expect(kept.messages).toHaveLength(2);
+            expect(kept.messages[1]).toMatchObject({ role: 'assistant', stopped: false, error: { code: 'SERVER_RESTARTED' } });
+            expect(kept.messages[1].content).toMatch(/^One/);
+            expect(kept.replying).toBe(false);
+            expect((await Chat.findById(chat.id).lean()).draft).toBeUndefined();
+
+            // A server that stopped without warning left a draft: once it has gone quiet it becomes the reply.
+            await Chat.updateOne({ _id: chat.id }, { $set: { draft: { content: 'Five six', thinking: '', steps: [{ tool: 'Note', input: 'x' }], model: 'qwen2.5-coder:7b', at: new Date(Date.now() - 60000) } } });
+            const other = await newChat({ model: 'qwen2.5-coder:7b' });
+            await Chat.updateOne({ _id: other.id }, { $set: { draft: { content: 'still being written', at: new Date() } } });
+            expect(await recoverReplies()).toBe(1);
+            const recovered = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(recovered.messages).toHaveLength(3);
+            expect(recovered.messages[2]).toMatchObject({ role: 'assistant', content: 'Five six', error: { code: 'SERVER_RESTARTED' } });
+            expect((await Chat.findById(chat.id).lean()).draft).toBeUndefined();
+            expect((await get(`/chats/${other.id}`)).data.chat.messages).toHaveLength(0);
+            await Chat.updateOne({ _id: other.id }, { $unset: { draft: 1 } });
+
+            // A reply that finishes leaves no draft behind.
+            await send(chat.id, { content: 'thanks' });
+            expect((await Chat.findById(chat.id).lean()).draft).toBeUndefined();
         });
 
         test('Stop ends a reply at once while its model is still loading into memory', async () => {
