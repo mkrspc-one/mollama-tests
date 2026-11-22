@@ -10,7 +10,7 @@ import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
-    fitModel, fitPool, poolShareMb, splitBySpeed, rankCatalogue, memoryNeededMb, VERDICTS,
+    fitModel, fitPool, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
@@ -919,6 +919,11 @@ describe('Fit rules', () => {
         expect(splitBySpeed([mac, pc], 15000)).toEqual([8.1, 6.5]);
         // A model too big for both together is split by what each can give.
         expect(splitBySpeed([mac, pc], 40000)).toEqual([10.5, 6.5]);
+        // What is sent to the main computer: the split while the model fits the graphics memory, and none past it, so
+        // llama.cpp's --fit can put the rest in the main computer's system memory.
+        expect(poolSplit([mac, pc], 15000)).toEqual([8.1, 6.5]);
+        expect(poolSplit([mac, pc], 40000)).toEqual([]);
+        expect(poolSplit([mac, pc], 0)).toEqual([]);
     });
 
     test('8 GB of graphics memory runs 7 to 9B models fully on the GPU', () => {
