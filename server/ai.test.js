@@ -3863,6 +3863,31 @@ describe('Chat endpoints', () => {
             });
         });
 
+        test('a reply never sends more than the model can read: read results are put away early and an unread one is cut', async () => {
+            const usual = state.contextLength;
+            try {
+                await withKey(async () => {
+                    state.contextLength = 5000;
+                    const ask = (n) => `duck ${n} ${'with a rig and textures '.repeat(90)}`.trim();
+                    state.toolPlan = [0, 1, 2].map((n) => [['web_search', { query: ask(n) }]]);
+                    state.chatReply = 'Here are the ducks.';
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'find duck models' });
+                    expect(list.at(-1).type).toBe('done');
+                    for (const call of state.chatCalls) {
+                        const tokens = call.messages.reduce((sum, message) => sum + Math.ceil(String(message.content || '').length / 4) + 4, 0);
+                        expect(tokens).toBeLessThanOrEqual(5000 - 2048);
+                    }
+                    const results = state.chatCalls.at(-1).messages.filter((message) => message.role === 'tool');
+                    expect(results[0].content).toMatch(/^\[Put away to save room/);
+                    expect(results[2].content).toContain('duck 2');
+                    expect(results.some((result) => /\[Cut here: the last [\d,]+ characters are more than this model can read at once/.test(result.content))).toBe(true);
+                });
+            } finally {
+                state.contextLength = usual;
+            }
+        });
+
         test('a model keeps notes with save_note: they go with every later message, a key replaces, and empty text removes', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.toolPlan = [[['save_note', { key: 'battery', text: '36 V, 14 Ah' }], ['save_note', { key: 'motor', text: '250 W hub' }]]];
@@ -5499,7 +5524,7 @@ describe('Linked devices', () => {
             }
             if (message.type === 'request' && message.via === 'pool') {
                 app.pooled.push({ path: message.path, body: JSON.parse(message.body || '{}') });
-                if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN' });
+                if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN', detail: 'The pooled model stopped: the lending computer at 10.9.4.20 could not be reached for 45 seconds.' });
                 send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'text/event-stream' } });
                 for (const piece of ['Pooled ', 'hello']) send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: piece } }] })}\n\n`).toString('base64') });
                 send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n`).toString('base64') });
@@ -5789,7 +5814,7 @@ describe('Linked devices', () => {
         mainApp.poolDown = true;
         const dropped = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Still there?' }, { responseType: 'text', validateStatus: () => true });
         const failed = String(dropped.data).trim().split('\n').map((line) => JSON.parse(line)).find((event) => event.type === 'error');
-        expect(failed).toMatchObject({ code: 'POOL_STOPPED' });
+        expect(failed).toMatchObject({ code: 'POOL_STOPPED', detail: 'The pooled model stopped: the lending computer at 10.9.4.20 could not be reached for 45 seconds.' });
         expect(failed.message).toMatch(/stopped answering/);
 
         // A pool that cannot start says what the computer that runs the model said, in the reply and once saved.
