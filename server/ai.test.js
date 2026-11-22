@@ -109,7 +109,8 @@ describe('Ollama error mapping', () => {
     });
 
     test('every code has a plain message that hides the raw error', () => {
-        for (const code of ERROR_CODES) {
+        // A pool's detail is written by Mollama's own desktop app and is shown, so the person can see why it did not start.
+        for (const code of ERROR_CODES.filter((one) => !['POOL_FAILED', 'POOL_STOPPED'].includes(one))) {
             const error = new OllamaError(code, 'raw internal text');
             expect(error.toJSON()).toEqual({ code, message: error.message, action: error.action });
             expect(JSON.stringify(error.toJSON())).not.toContain('raw internal text');
@@ -5480,6 +5481,8 @@ describe('Linked devices', () => {
             }
             if (message.type === 'pool' && message.action === 'run') {
                 app.runs.push({ model: message.model, helpers: message.helpers, split: message.split, ctx: message.ctx });
+                if (app.runError) return send({ id: message.id, type: 'answer', data: { error: app.runError } });
+                if (app.holdRun) return held.push(() => send({ id: message.id, type: 'answer', data: { ready: true } }));
                 send({ type: 'pool-state', data: { build, role: 'main', setup: 'ready', lending: false, address: null, allow: [], port: 50052, running: message.model, detail: null } });
                 return send({ id: message.id, type: 'answer', data: { ready: true } });
             }
@@ -5777,6 +5780,30 @@ describe('Linked devices', () => {
         const failed = String(dropped.data).trim().split('\n').map((line) => JSON.parse(line)).find((event) => event.type === 'error');
         expect(failed).toMatchObject({ code: 'POOL_STOPPED' });
         expect(failed.message).toMatch(/stopped answering/);
+
+        // A pool that cannot start says what the computer that runs the model said, in the reply and once saved.
+        mainApp.poolDown = false;
+        mainApp.runError = 'The pooled model could not start: failed to connect to 10.9.4.20:50052';
+        mainApp.ws.send(JSON.stringify({ type: 'pool-state', data: { build: 'b12591', role: 'main', setup: 'ready', lending: false, address: null, allow: [], port: 50052, running: null, detail: null } }));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const unstarted = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Start again' }, { responseType: 'text', validateStatus: () => true });
+        const refused = String(unstarted.data).trim().split('\n').map((line) => JSON.parse(line)).find((event) => event.type === 'error');
+        expect(refused).toMatchObject({ code: 'POOL_FAILED', detail: mainApp.runError });
+        const saved = (await client.get(`/api/v1/chats/${made.data.chat.id}`)).data.chat.messages.at(-1);
+        expect(saved.error).toMatchObject({ code: 'POOL_FAILED', detail: mainApp.runError });
+        mainApp.runError = null;
+
+        // Stop while the pool is still starting the model ends the reply at once, without waiting for the start.
+        mainApp.holdRun = true;
+        const slow = client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Slow start' }, { responseType: 'text', validateStatus: () => true });
+        for (let tries = 0; tries < 60 && mainApp.runs.length < 4; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        const pressed = Date.now();
+        await client.post(`/api/v1/chats/${made.data.chat.id}/stop`);
+        await slow;
+        expect(Date.now() - pressed).toBeLessThan(3000);
+        expect((await client.get(`/api/v1/chats/${made.data.chat.id}`)).data.chat.replying).toBeFalsy();
+        mainApp.holdRun = false;
+        mainApp.release();
 
         // With no computer lending, the pool is not offered and a chat on it says why.
         await client.put(`/api/v1/devices/${lender.id}/pool`, { role: 'off' });
