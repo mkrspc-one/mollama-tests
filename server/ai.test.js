@@ -3823,6 +3823,36 @@ describe('Chat endpoints', () => {
             });
         });
 
+        test('an idle model makes way for a chat that stays open, never one a reply is using', async () => {
+            state.models = [{ name: 'next:8b', size: 5 * 1024 * MB, details: {} }, { name: 'other:8b', size: 5 * 1024 * MB, details: {} }, { name: 'huge:70b', size: 60 * 1024 * MB, details: {} }];
+            const load = async (name, swap) => (await post('/models/load', { name, ...(swap ? { swap } : {}) })).data;
+            await withHardware({ memoryMb: 32768, gpuMemoryMb: 8192, gpuName: 'Small card' }, async () => {
+                state.running = [{ name: 'other:8b', size: 6 * 1024 * MB, size_vram: 6 * 1024 * MB }];
+                // Opened: nothing is loaded or unloaded yet, and the page is told another model is in the way.
+                expect(await load('next:8b')).toMatchObject({ loading: false, inPlace: true });
+                await wait(30);
+                expect(state.unloaded).toEqual([]);
+                // A model that would not fit even alone never takes another's place.
+                expect(await load('huge:70b', true)).toMatchObject({ loading: false, inPlace: false });
+                expect(state.unloaded).toEqual([]);
+                // Still open: the idle one goes first, then this one loads.
+                const busyIn = queue.busyIn;
+                queue.busyIn = () => true;
+                try {
+                    expect(await load('next:8b', true)).toMatchObject({ loading: false, inPlace: false });
+                    expect(state.unloaded).toEqual([]);
+                } finally {
+                    queue.busyIn = busyIn;
+                }
+                const swapped = load('next:8b', true);
+                for (let tries = 0; tries < 100 && state.unloaded.length === 0; tries += 1) await wait(20);
+                state.running = [];
+                expect(await swapped).toMatchObject({ loading: true });
+                await wait(30);
+                expect(state.unloaded.map((entry) => [entry.model, entry.keep_alive === 0])).toEqual([['other:8b', true], ['next:8b', false]]);
+            });
+        });
+
         test('loads a named model', async () => {
             const response = await post('/models/load', { name: 'custom-thing:latest' });
             expect(response.data).toMatchObject({ model: 'custom-thing:latest', loading: true });
