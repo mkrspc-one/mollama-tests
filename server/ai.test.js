@@ -891,13 +891,31 @@ describe('Fit rules', () => {
     const workstation = { memoryMb: 65536, gpuMemoryMb: 24576 };
     const noCard = { memoryMb: 16384, gpuMemoryMb: 0 };
 
+    test('a fit says where the model sits once it runs and what each memory has left', () => {
+        const small = { sizeMb: 4000, parameters: 7 };
+        const middle = { sizeMb: 15000, parameters: 24 };
+        // All on the graphics card: system memory is untouched.
+        expect(fitModel(small, laptop)).toMatchObject({ memoryNeededMb: 5200, place: { gpuMb: 5200, ramMb: 0, gpuLeftMb: 8192 - 5200, ramLeftMb: 32768 } });
+        // Past the graphics card less its headroom, the rest sits in system memory.
+        expect(fitModel(middle, laptop).place).toEqual({ gpuMb: 6656, ramMb: 17300 - 6656, gpuLeftMb: 1536, ramLeftMb: 32768 - (17300 - 6656) });
+        // No graphics card: all of it in system memory. A chip that shares its memory gives all of it from that one memory.
+        expect(fitModel(small, noCard).place).toEqual({ gpuMb: 0, ramMb: 5200, gpuLeftMb: null, ramLeftMb: 16384 - 5200 });
+        expect(fitModel(small, { memoryMb: 18432, gpuMemoryMb: 12288, gpuShared: true }).place).toEqual({ gpuMb: 5200, ramMb: 0, gpuLeftMb: 12288 - 5200, ramLeftMb: 18432 - 5200 });
+        expect(fitModel({ sizeMb: 60000, parameters: 70 }, laptop).place).toBeNull();
+        // Pooled: what the computers lend first, the rest in the primary computer's system memory.
+        const large = { sizeMb: 19000, parameters: 32 };
+        expect(fitPool(large, [{ ...laptop, runs: true }, laptop]).place).toEqual({ gpuMb: 6656 * 2, ramMb: 21700 - 6656 * 2, gpuLeftMb: 8192 * 2 - 6656 * 2, ramLeftMb: 32768 - (21700 - 6656 * 2) });
+        expect(fitPool(small, [{ ...laptop, runs: true }, laptop]).place).toEqual({ gpuMb: 5200, ramMb: 0, gpuLeftMb: 8192 * 2 - 5200, ramLeftMb: 32768 });
+        expect(fitPool({ sizeMb: 60000, parameters: 70 }, [laptop, laptop]).place).toBeNull();
+    });
+
     test('a model too large for one computer fits several pooled when what they can give together is enough', () => {
         // Each gives its graphics memory less the headroom, or with no graphics card its system memory less the reserve.
         expect(poolShareMb(laptop)).toBe(8192 - 1536);
         expect(poolShareMb(noCard)).toBe(16384 - 4096);
         const big = { sizeMb: 15000, parameters: 24 };
         expect(fitModel(big, noCard).fits).toBe(false);
-        expect(fitPool(big, [noCard, noCard])).toEqual({ fits: true, memoryMb: 12288 * 2, memoryNeededMb: memoryNeededMb(big) });
+        expect(fitPool(big, [noCard, noCard])).toMatchObject({ fits: true, memoryMb: 12288 * 2, memoryNeededMb: memoryNeededMb(big) });
         // The computer that runs the model also gives its system memory for layers that do not fit graphics memory.
         expect(fitPool(big, [laptop, laptop])).toMatchObject({ fits: true, memoryMb: 6656 * 2 + (32768 - 4096) });
         expect(fitPool({ sizeMb: 60000, parameters: 70 }, [laptop, laptop]).fits).toBe(false);
@@ -1555,8 +1573,24 @@ describe('Model endpoints', () => {
 
             signOut();
             const visitor = await get('/catalogue?memoryMb=32768&gpuMemoryMb=8192');
-            const pairs = (data) => data.models.map((model) => [model.tag, model.fit.verdict, model.pick]);
-            expect(pairs(mine.data)).toEqual(pairs(visitor.data));
+            const verdicts = (data) => data.models.map((model) => [model.tag, model.fit.verdict]).sort();
+            expect(verdicts(mine.data)).toEqual(verdicts(visitor.data));
+
+            // The list for a computer is only the list: the recommended models are asked for on their own, and no
+            // search or filter changes them.
+            expect(mine.data.models.every((model) => model.pick === null && !model.pickLabel)).toBe(true);
+            expect(mine.data.paged).toBe(mine.data.total);
+            const picks = visitor.data.models.filter((model) => model.pick).map((model) => [model.tag, model.pick]);
+            expect(picks.length).toBeGreaterThanOrEqual(3);
+            expect((await get(`/devices/${device.id}/recommended`)).status).toBe(401);
+            await testStartup.loginAsUser('admin');
+            const recommended = await get(`/devices/${device.id}/recommended`);
+            expect(recommended.data.models.map((model) => [model.tag, model.pick])).toEqual(picks);
+            expect(recommended.data.models.every((model) => model.pickLabel && typeof model.installed === 'boolean' && typeof model.fitsDisk === 'boolean' && model.fit.place)).toBe(true);
+            const narrowed = await get(`/devices/${device.id}/catalogue?q=gemma&size=4`);
+            expect(narrowed.data.models.length).toBeLessThanOrEqual(4);
+            expect(narrowed.data.models.every((model) => model.tag.includes('gemma'))).toBe(true);
+            expect((await get('/devices/64b7f0c2a1b2c3d4e5f60718/recommended')).status).toBe(404);
 
             await setHardware(BIG_DEVICE);
         });
@@ -3923,6 +3957,36 @@ describe('Chat endpoints', () => {
                 });
             } finally {
                 state.contextLength = usual;
+            }
+        });
+
+        test('a reply cut short with nothing written and no more room to give puts away what was read, then is asked again', async () => {
+            const usual = state.contextLength;
+            try {
+                await withKey(async () => {
+                    state.contextLength = 5000;
+                    const ask = (n) => `duck ${n} ${'with a rig and textures '.repeat(40)}`.trim();
+                    state.toolPlan = [0, 1].map((n) => [['web_search', { query: ask(n) }]]);
+                    // After the two searches the model starts something too long for the room left, such as a long
+                    // function call, and is cut off with nothing written.
+                    state.endings = ['length', 'stop'];
+                    state.replyPlan = ['', 'Here are the ducks.'];
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    state.chatCalls.length = 0;
+                    const { events: list } = await send(chat.id, { content: 'find duck models' });
+                    expect(list.at(-1)).toMatchObject({ type: 'done' });
+                    expect(list.at(-1).reply.content).toBe('Here are the ducks.');
+                    expect(list.at(-1).reply.error).toBeNull();
+                    expect(list.some((event) => event.type === 'note' && event.text === 'Making room for a longer reply and trying again…')).toBe(true);
+                    const tokens = (call) => call.messages.reduce((sum, message) => sum + Math.ceil(String(message.content || '').length / 4) + 4, 0);
+                    expect(state.chatCalls).toHaveLength(4);
+                    expect(state.chatCalls[3].messages.filter((message) => message.role === 'tool').every((result) => /^\[Put away to save room/.test(result.content))).toBe(true);
+                    expect(tokens(state.chatCalls[3])).toBeLessThanOrEqual(5000 - 4096);
+                });
+            } finally {
+                state.contextLength = usual;
+                state.endings = [];
+                state.replyPlan = [];
             }
         });
 
