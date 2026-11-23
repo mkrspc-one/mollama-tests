@@ -2823,6 +2823,25 @@ describe('Chat endpoints', () => {
             expect((await fetch(`${client.baseURL}/api/v1/chats/${chat.id}/reply`, { headers: { Cookie: cookie } })).status).toBe(204);
         });
 
+        test('deleting a chat that is replying stops the model, and nothing is left running for it', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            const before = state.chatAborted;
+            const stream = await openStream(chat.id, { content: 'long request' });
+            await stream.until((event) => event.type === 'token');
+            expect((await post(`/chats/${chat.id}/messages`, { content: 'and then this' })).status).toBe(202);
+
+            expect((await remove(`/chats/${chat.id}`)).status).toBe(200);
+            expect(state.chatAborted).toBe(before + 1);
+            state.chatHold = false;
+            await stream.finished;
+            await wait(80);
+            expect((await get(`/chats/${chat.id}`)).status).toBe(404);
+            expect((await get('/activity')).data.replies.some((reply) => reply.chatId === chat.id)).toBe(false);
+            expect(await Chat.countDocuments({ _id: chat.id })).toBe(0);
+        });
+
         test('a reply sent live answers at once and goes out on the live connection, numbered and in order', async () => {
             const service = getNotificationService();
             const sent = [];
