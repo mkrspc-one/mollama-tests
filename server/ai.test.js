@@ -10,7 +10,7 @@ import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
-    fitModel, fitPool, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
+    fitModel, fitPool, freeHardware, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
@@ -109,8 +109,8 @@ describe('Ollama error mapping', () => {
     });
 
     test('every code has a plain message that hides the raw error', () => {
-        // A pool's detail is written by Mollama's own desktop app and is shown, so the person can see why it did not start.
-        for (const code of ERROR_CODES.filter((one) => !['POOL_FAILED', 'POOL_STOPPED'].includes(one))) {
+        // These details are written by Mollama itself and are shown: why a pool did not start, and how much memory a model needs.
+        for (const code of ERROR_CODES.filter((one) => !['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY'].includes(one))) {
             const error = new OllamaError(code, 'raw internal text');
             expect(error.toJSON()).toEqual({ code, message: error.message, action: error.action });
             expect(JSON.stringify(error.toJSON())).not.toContain('raw internal text');
@@ -978,6 +978,23 @@ describe('Fit rules', () => {
         const needed = memoryNeededMb(model);
         expect(fitModel(model, { memoryMb: 0, gpuMemoryMb: needed + 1536 }).verdict).toBe('gpu');
         expect(fitModel(model, { memoryMb: 0, gpuMemoryMb: needed + 1535 }).verdict).toBe('too_large');
+    });
+
+    test('what is free right now is judged the same way as the whole computer', () => {
+        const pc = { memoryMb: 32768, gpuMemoryMb: 8192 };
+        expect(freeHardware(pc, null)).toBe(pc);
+        expect(freeHardware(pc, { freeMb: null, gpuFreeMb: 4000 })).toBe(pc);
+        // Plenty free never makes a computer larger than it is.
+        expect(freeHardware(pc, { freeMb: 90000, gpuFreeMb: 90000 })).toEqual(pc);
+        expect(freeHardware(pc, { freeMb: 10240, gpuFreeMb: 3000 })).toEqual({ memoryMb: 10240 - 2048 + 4096, gpuMemoryMb: 3000 + 1536 });
+        expect(freeHardware(pc, { freeMb: 10240 }).gpuMemoryMb).toBe(8192);
+        expect(freeHardware(pc, { freeMb: 10240, gpuFreeMb: 0 }).gpuMemoryMb).toBe(1536);
+        // An Apple chip's free memory is counted once, for its graphics and the rest together.
+        const mac = { memoryMb: 18432, gpuMemoryMb: 12288, gpuShared: true };
+        const now = freeHardware(mac, { freeMb: 8048 });
+        expect(fitModel({ sizeMb: (6000 - 800) / 1.1, parameters: 0 }, now).fits).toBe(true);
+        expect(fitModel({ sizeMb: (6100 - 800) / 1.1, parameters: 0 }, now).fits).toBe(false);
+        expect(freeHardware(mac, { freeMb: 90000 })).toEqual(mac);
     });
 
     test('missing or odd hardware never throws', () => {
@@ -2366,6 +2383,17 @@ describe('Chat endpoints', () => {
         headers: { 'Content-Type': 'application/octet-stream' }
     });
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    // The computer's sizes as its owner wrote them in; none puts back what was read from the test machine.
+    const withHardware = async (overrides, work) => {
+        await get('/devices');
+        await Device.updateOne({ kind: 'local' }, { $set: { overrides } });
+        try {
+            return await work();
+        } finally {
+            state.running = [];
+            await Device.updateOne({ kind: 'local' }, { $set: { overrides: {} } });
+        }
+    };
 
     let filesCalls = [];
     const fsFiles = {
@@ -3774,6 +3802,27 @@ describe('Chat endpoints', () => {
             }
         });
 
+        test('never loads ahead a model that does not fit the graphics memory, or beside one already there', async () => {
+            state.models = [{ name: 'huge:70b', size: 20 * 1024 * MB, details: {} }];
+            const load = async () => (await post('/models/load', { name: 'huge:70b' })).data;
+            await withHardware({ memoryMb: 32768, gpuMemoryMb: 8192, gpuName: 'Small card' }, async () => {
+                expect(await load()).toMatchObject({ ready: false, loading: false });
+            });
+            await withHardware({ memoryMb: 262144, gpuMemoryMb: 8192, gpuName: 'Small card' }, async () => {
+                expect((await load()).loading).toBe(false);
+            });
+            await withHardware({ memoryMb: 32768, gpuMemoryMb: 25600, gpuName: 'Large card' }, async () => {
+                state.running = [{ name: 'other:8b', size: 6 * 1024 * MB, size_vram: 6 * 1024 * MB }];
+                expect((await load()).loading).toBe(false);
+                state.running = [];
+                await wait(30);
+                expect(state.unloaded).toEqual([]);
+                expect((await load()).loading).toBe(true);
+                await wait(30);
+                expect(state.unloaded.map((entry) => entry.model)).toEqual(['huge:70b']);
+            });
+        });
+
         test('loads a named model', async () => {
             const response = await post('/models/load', { name: 'custom-thing:latest' });
             expect(response.data).toMatchObject({ model: 'custom-thing:latest', loading: true });
@@ -3798,6 +3847,28 @@ describe('Chat endpoints', () => {
             client.clearCookies();
             client.authenticatedAs = null;
             expect((await post('/models/load', {})).status).toBeGreaterThanOrEqual(401);
+        });
+    });
+
+    describe('A model larger than the computer', () => {
+        test('a message to it is refused with the sizes, nothing is saved or loaded, and it is sent on the person\'s word', async () => {
+            state.models = [{ name: 'huge:70b', size: 40 * 1024 * MB, details: {} }];
+            await withHardware({ memoryMb: 32768, gpuMemoryMb: 8192, gpuName: 'Small card' }, async () => {
+                const chat = await newChat({ model: 'huge:70b' });
+                const asked = state.chatCalls.length;
+                const refused = await post(`/chats/${chat.id}/messages`, { content: 'hi' });
+                expect(refused.status).toBe(409);
+                expect(refused.data).toMatchObject({ success: false, code: 'NOT_ENOUGH_MEMORY' });
+                expect(refused.data.detail).toMatch(/huge:70b needs about 45 GB and .* has about 35 GB for models\. Loading it could freeze the whole computer\./);
+                expect(state.chatCalls.length).toBe(asked);
+                expect((await get(`/chats/${chat.id}`)).data.chat.messages).toEqual([]);
+
+                expect((await send(chat.id, { content: 'hi', anyway: true })).response.status).toBe(200);
+                expect(state.chatCalls.length).toBeGreaterThan(asked);
+
+                state.running = [{ name: 'huge:70b', size: 100, size_vram: 100 }];
+                expect((await send(chat.id, { content: 'again' })).response.status).toBe(200);
+            });
         });
     });
 
@@ -5655,12 +5726,21 @@ describe('Linked devices', () => {
                 app.probes.push(`${message.address}:${message.port}`);
                 return send({ id: message.id, type: 'answer', data: app.reach });
             }
+            if (message.type === 'ask' && message.what === 'memory' && app.freeMb) return send({ id: message.id, type: 'answer', data: { freeMb: app.freeMb, gpuFreeMb: app.gpuFreeMb ?? null } });
+            if (message.type === 'pool' && message.action === 'stop') {
+                app.stops = (app.stops || 0) + 1;
+                return send({ type: 'pool-state', data: { build, role: 'main', setup: 'ready', lending: false, address: null, allow: [], port: 50052, running: null, detail: null } });
+            }
+            if (message.type === 'request' && message.path === '/api/generate') {
+                app.unloads = [...(app.unloads || []), JSON.parse(message.body || '{}')];
+                app.running = [];
+            }
             if (message.type === 'ask') {
                 return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768, ...((app.network || network) ? { network: app.network || network } : {}) } });
             }
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
-            const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? TAGS : message.path === '/api/ps' ? { models: [] }
+            const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? (app.tags || TAGS) : message.path === '/api/ps' ? { models: app.running || [] }
                 : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: { 'llama.context_length': 8192 }, details: {} } : null;
             if (!body) {
                 const notFound = () => {
@@ -5900,7 +5980,7 @@ describe('Linked devices', () => {
         const main = await link('run-main');
         const lender = await link('run-lender');
         const mainApp = await fakeApp(main.id, main.key, { network: home('10.9.4.10') });
-        await fakeApp(lender.id, lender.key, { network: home('10.9.4.20') });
+        const lenderApp = await fakeApp(lender.id, lender.key, { network: home('10.9.4.20') });
         const pickable = async () => (await client.get('/api/v1/devices?with=online')).data.devices.find((one) => one.kind === 'pool');
         expect(await pickable()).toBeUndefined();
 
@@ -5918,6 +5998,13 @@ describe('Linked devices', () => {
         const models = (await client.client.get('/api/v1/models', through(pool.id))).data.models.map((one) => one.name);
         expect(models).toEqual(['tiny:1b']);
 
+        mainApp.running = [{ name: 'other:8b', size: 100, size_vram: 100 }];
+        // Opening a chat on the pool starts nothing: only a message does.
+        const opened = await client.client.post('/api/v1/models/load', { name: 'tiny:1b' }, through(pool.id));
+        expect(opened.data).toMatchObject({ ready: false, loading: false });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(mainApp.runs).toEqual([]);
+
         const made = await client.post('/api/v1/chats', { model: 'tiny:1b', device: pool.id });
         const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Hello pool' }, { responseType: 'text', validateStatus: () => true });
         const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
@@ -5927,9 +6014,29 @@ describe('Linked devices', () => {
         expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
         expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
 
+        // Nothing is loaded ahead on a computer already running a pooled model.
+        expect((await client.client.post('/api/v1/models/load', { name: 'tiny:1b' }, through(main.id))).data.loading).toBe(false);
+
+        // Ollama's own models made way for the pooled one.
+        expect(mainApp.unloads).toEqual([expect.objectContaining({ model: 'other:8b', keep_alive: 0 })]);
+
         // A second message uses the model already running: it is not started again.
         await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Again' }, { responseType: 'text', validateStatus: () => true });
         expect(mainApp.runs).toHaveLength(1);
+
+        // A message to one of the main computer's own models ends the idle pooled one first, so both are never held at once.
+        const own = (await client.post('/api/v1/chats', { model: 'tiny:1b', device: main.id })).data.chat;
+        await client.client.post(`/api/v1/chats/${own.id}/messages`, { content: 'Hello computer' }, { responseType: 'text', validateStatus: () => true });
+        expect(mainApp.stops).toBe(1);
+
+        // Too little free memory across the pool is said before anything starts there.
+        for (const app of [mainApp, lenderApp]) Object.assign(app, { freeMb: 1500, gpuFreeMb: 100 });
+        const before = mainApp.runs.length;
+        const tight = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Room?' }, { responseType: 'text', validateStatus: () => true });
+        expect(tight.status).toBe(409);
+        expect(String(tight.data)).toMatch(/NOT_ENOUGH_MEMORY/);
+        expect(mainApp.runs).toHaveLength(before);
+        for (const app of [mainApp, lenderApp]) app.freeMb = null;
 
         // A computer that drops out ends the reply with a plain reason.
         mainApp.poolDown = true;
@@ -6319,6 +6426,39 @@ describe('Linked devices', () => {
         const mine = await client.post('/api/v1/chats', {});
         expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: id })).status).toBe(404);
         expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: 'not-an-id' })).status).toBe(400);
+    });
+
+    test('a message is refused when the model is larger than what its computer has free right now', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('nearly-full');
+        await Device.updateOne({ _id: id }, { $set: { overrides: { memoryMb: 32768, gpuMemoryMb: 8192, gpuName: 'Small card' } } });
+        const app = await fakeApp(id, key);
+        app.tags = { models: [{ ...TAGS.models[0], name: 'big:30b', model: 'big:30b', size: 19 * 1024 * MB }] };
+        const chat = (await client.post('/api/v1/chats', { device: id, model: 'big:30b' })).data.chat;
+        const say = (body) => client.client.post(`/api/v1/chats/${chat.id}/messages`, body, { responseType: 'text', validateStatus: () => true });
+
+        app.freeMb = 9000;
+        const refused = await say({ content: 'hi' });
+        expect(refused.status).toBe(409);
+        expect(String(refused.data)).toMatch(/NOT_ENOUGH_MEMORY/);
+        expect(String(refused.data)).toMatch(/big:30b needs about 22 GB and .* has about 13 GB free/);
+        expect(app.requests).not.toContain('POST /api/chat');
+
+        // What Ollama would unload to make room counts as free.
+        app.running = [{ name: 'other:13b', size: 15000 * MB, size_vram: 5000 * MB }];
+        expect((await say({ content: 'hi' })).status).toBe(200);
+        expect(app.requests).toContain('POST /api/chat');
+
+        // Another program, such as a game, on the graphics card counts too.
+        app.running = [];
+        app.freeMb = 18500;
+        expect((await say({ content: 'hi' })).status).toBe(200);
+        app.gpuFreeMb = 500;
+        expect((await say({ content: 'hi' })).status).toBe(409);
+
+        // A desktop app too old to say what is free is judged by the computer's whole memory.
+        app.freeMb = null;
+        expect((await say({ content: 'hi' })).status).toBe(200);
     });
 
     test('a paused computer stays connected, is given no work, and works again when resumed', async () => {
