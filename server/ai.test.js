@@ -6001,7 +6001,7 @@ describe('Chat endpoints', () => {
                     if (line.includes('timeout')) {
                         renders += 1;
                         const events = renders === 1
-                            ? [{ type: 'output', stream: 'stdout', data: '✓ page.html  kit inlined\n  ✗ a label is cut off at 390px\n✗ 1 visual problem(s); the page was written. Fix them and render again.\n' }, { type: 'exit', exit_code: 1 }]
+                            ? [{ type: 'output', stream: 'stdout', data: '✓ page.html  kit inlined\n  ✗ a label is cut off at 390px\n  ✗ a diagram label renders at 10.44px at 390px ("Fixed Jaw"); keep labels at 12px or more\n✗ 1 visual problem(s); the page was written. Fix them and render again.\n' }, { type: 'exit', exit_code: 1 }]
                             : [{ type: 'output', stream: 'stdout', data: '✓ page.html  kit inlined\n  ✓ Visual check: no problems\n' }, { type: 'exit', exit_code: 0 }];
                         return (async function* () { yield* events; })();
                     }
@@ -6024,7 +6024,7 @@ describe('Chat endpoints', () => {
                 // A render may reach the two addresses its page's fonts come from, and nothing else.
                 expect(started[0].networkPolicy).toEqual({ type: 'allow-list', rules: [{ domain: 'fonts.googleapis.com' }, { domain: 'fonts.gstatic.com' }] });
                 expect(uploaded.find((one) => one.where === '/root/job/main.sh').text).toMatch(/^node \/root\/skills\/visual-explainer\/kit\/render\.mjs page\.src\.html -o page\.html/);
-                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^Not shown yet\. The render found something to fix:\n[\s\S]*a label is cut off at 390px[\s\S]*Fix these and call visual_explainer_render again/);
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^Not shown yet\. The render found something to fix:\n[\s\S]*a label is cut off at 390px[\s\S]*Enough, in one change: “Fixed Jaw”: make its font-size 1\.17 times what it is, for every label of that size, and move any that would then lie on the drawing\.\nMend it with visual_explainer_change, sending only the lines that change\.$/);
                 expect(state.chatCalls[2].messages.at(-1).content).toMatch(/^Rendered and showed "Cache reads" to the user in the chat, in the app's theme\. Report:/);
 
                 // The reply holds the page with the kit's files named, and the theme in place of the kit's colours.
@@ -6036,6 +6036,27 @@ describe('Chat endpoints', () => {
                 expect(shown).toContain('<style data-ve-kit>/*VE_CSS_1*/</style>');
                 expect(shown).not.toContain(css.slice(0, 300));
                 expect(shown.length).toBeLessThan(2000);
+
+                // What was only left out is put in: the kit's link, and a label on a drawing that has none. A script's text,
+                // a labelled drawing and decoration are left alone. A page is mended by sending only what changes.
+                renders = 1;
+                uploaded.length = 0;
+                state.chatCalls.length = 0;
+                const bare = '<html><head><title>Vise</title></head><body><main><svg id="viseSvg" viewBox="0 0 9 9"><path d="M0 0"/></svg><svg aria-hidden="true"></svg><svg aria-label="Kept"></svg><svg><title>Named</title></svg><script>const s = "<svg>";</script></main></body></html>';
+                state.toolPlan = [[['visual_explainer_render', { page: bare, title: 'Bench vise' }]], [['visual_explainer_change', { change: [{ find: 'aria-label="Bench vise"', replace: 'aria-label="A vise whose jaw follows the pointer"' }] }]], [['visual_explainer_change', { change: [{ find: 'no such text', replace: 'x' }] }]], [['visual_explainer_change', { show: '1-3' }]]];
+                const mended = await send(chat.id, { content: 'draw a vise' });
+                const pages = uploaded.filter((one) => one.where === '/root/work/page.src.html').map((one) => one.text);
+                expect(pages).toHaveLength(2);
+                expect(pages[0]).toContain('<head>\n<link rel="stylesheet" href="kit.css" data-ve-kit>');
+                expect(pages[0]).toContain('<svg id="viseSvg" viewBox="0 0 9 9" aria-label="Bench vise">');
+                expect(pages[0]).toContain('<svg aria-hidden="true"></svg><svg aria-label="Kept"></svg><svg><title>Named</title></svg><script>const s = "<svg>";</script>');
+                expect(pages[1]).toContain('aria-label="A vise whose jaw follows the pointer"');
+                expect(state.chatCalls[1].messages.filter((message) => message.role === 'tool')[0].content).toContain('Put in for you: the kit\'s link in <head>; aria-label="Bench vise" on a drawing that had none.');
+                const told = state.chatCalls.at(-1).messages.filter((message) => message.role === 'tool').map((message) => message.content);
+                expect(told[2]).toMatch(/^Nothing was changed or rendered\. The find text of change 1 is not in it\./);
+                expect(told[3]).toMatch(/^Lines 1 to /);
+                expect(mended.events.at(-1).reply.content.match(/<Frame /g)).toHaveLength(1);
+                expect(mended.events.at(-1).reply.steps[0].sent).toContain('viseSvg');
 
                 // A long page is shown whole to the person but sent back to the model as one line.
                 body = 'x'.repeat(8000);
