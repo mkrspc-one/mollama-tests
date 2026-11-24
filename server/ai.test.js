@@ -2395,6 +2395,44 @@ describe('Chat endpoints', () => {
         }
     };
 
+    const openStream = async (chatId, body) => {
+        const controller = new AbortController();
+        const cookie = client.cookieJar.getCookieStringSync(client.baseURL);
+        const response = await fetch(`${client.baseURL}/api/v1/chats/${chatId}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Cookie: cookie, 'X-CSRF-Token': client.getCsrfTokenFromCookies() },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const seen = [];
+        const pump = (async () => {
+            let buffer = '';
+            try {
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    lines.filter(Boolean).forEach((line) => seen.push(JSON.parse(line)));
+                }
+            } catch {
+                return seen;
+            }
+            return seen;
+        })();
+        const until = async (check) => {
+            for (let attempt = 0; attempt < 200; attempt++) {
+                if (seen.some(check)) return;
+                await wait(15);
+            }
+            throw new Error(`stream never showed the expected event: ${JSON.stringify(seen)}`);
+        };
+        return { seen, until, stop: () => controller.abort(), finished: pump };
+    };
+
     let filesCalls = [];
     const fsFiles = {
         '/docs/brief.md': { type: 'text', content: 'The client wants a harbour survey by June.' },
@@ -2784,44 +2822,6 @@ describe('Chat endpoints', () => {
     });
 
     describe('Stopping and waiting', () => {
-        const openStream = async (chatId, body) => {
-            const controller = new AbortController();
-            const cookie = client.cookieJar.getCookieStringSync(client.baseURL);
-            const response = await fetch(`${client.baseURL}/api/v1/chats/${chatId}/messages`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Cookie: cookie, 'X-CSRF-Token': client.getCsrfTokenFromCookies() },
-                body: JSON.stringify(body),
-                signal: controller.signal
-            });
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            const seen = [];
-            const pump = (async () => {
-                let buffer = '';
-                try {
-                    for (;;) {
-                        const { value, done } = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop();
-                        lines.filter(Boolean).forEach((line) => seen.push(JSON.parse(line)));
-                    }
-                } catch {
-                    return seen;
-                }
-                return seen;
-            })();
-            const until = async (check) => {
-                for (let attempt = 0; attempt < 200; attempt++) {
-                    if (seen.some(check)) return;
-                    await wait(15);
-                }
-                throw new Error(`stream never showed the expected event: ${JSON.stringify(seen)}`);
-            };
-            return { seen, until, stop: () => controller.abort(), finished: pump };
-        };
-
         test('leaving the page does not stop the reply, and coming back picks it up from the start', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatReply = 'One two three four';
@@ -3889,9 +3889,17 @@ describe('Chat endpoints', () => {
                 const refused = await post(`/chats/${chat.id}/messages`, { content: 'hi' });
                 expect(refused.status).toBe(409);
                 expect(refused.data).toMatchObject({ success: false, code: 'NOT_ENOUGH_MEMORY' });
-                expect(refused.data.detail).toMatch(/huge:70b needs about 45 GB and .* has about 35 GB for models\. Loading it could freeze the whole computer\./);
+                expect(refused.data.detail).toMatch(/huge:70b needs about 45 GB and .* has about 35 GB for models\. It is larger than this computer can hold, even with nothing else in memory\. Loading it could freeze the whole computer\./);
                 expect(state.chatCalls.length).toBe(asked);
                 expect((await get(`/chats/${chat.id}`)).data.chat.messages).toEqual([]);
+
+                // What is already in memory there comes with the refusal, so it can be removed.
+                state.running = [{ name: 'other:8b', size: 6 * 1024 * MB, size_vram: 6 * 1024 * MB }];
+                const again = (await post(`/chats/${chat.id}/messages`, { content: 'hi' })).data;
+                expect(again.loaded).toEqual([expect.objectContaining({ name: 'other:8b', state: 'idle', gpuMb: 6144, ramMb: 0, deviceName: expect.any(String) })]);
+                expect(again.fitsEmpty).toBe(false);
+                expect(again.loaded[0].device).toMatch(/^[0-9a-f]{24}$/);
+                state.running = [];
 
                 expect((await send(chat.id, { content: 'hi', anyway: true })).response.status).toBe(200);
                 expect(state.chatCalls.length).toBeGreaterThan(asked);
@@ -3899,6 +3907,73 @@ describe('Chat endpoints', () => {
                 state.running = [{ name: 'huge:70b', size: 100, size_vram: 100 }];
                 expect((await send(chat.id, { content: 'again' })).response.status).toBe(200);
             });
+        });
+    });
+
+    describe('What is in memory', () => {
+        const here = async () => (await get('/devices/memory')).data.computers[0];
+
+        test('each model says what it takes, what it is doing and for how long it has been idle', async () => {
+            await Setting.deleteMany({});
+            await Setting.create({ keepAliveMinutes: 10 });
+            state.running = [{ name: 'qwen2.5-coder:7b', size: 6 * 1024 * MB, size_vram: 4 * 1024 * MB, context_length: 8192, expires_at: new Date(Date.now() + 7 * 60 * 1000).toISOString() }];
+            const computer = await here();
+            expect(computer).toMatchObject({ online: true, answered: true, role: 'off', lending: null });
+            expect(computer.memory.totalMb).toBeGreaterThan(256);
+            expect(computer.models).toHaveLength(1);
+            expect(computer.models[0]).toMatchObject({ name: 'qwen2.5-coder:7b', source: 'ollama', sizeMb: 6144, gpuMb: 4096, ramMb: 2048, context: 8192, state: 'idle', chat: null });
+            // Kept ten minutes after its last use with seven left: three minutes idle, unless a chat used it since.
+            expect(computer.models[0].idleMs).toBeLessThan(3.2 * 60 * 1000);
+
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', title: 'Harbour notes' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            const stream = await openStream(chat.id, { content: 'long request' });
+            await stream.until((event) => event.type === 'token');
+            const busy = (await here()).models[0];
+            expect(busy).toMatchObject({ state: 'answering', chat: { id: chat.id, title: 'Harbour notes' }, usedAt: null, idleMs: null, endsAt: null, replies: 1 });
+
+            // One that is answering is left alone, until its reply is to be stopped as well.
+            const id = (await here()).id;
+            const refused = await post(`/devices/${id}/memory`, { model: 'qwen2.5-coder:7b' });
+            expect(refused.status).toBe(409);
+            expect(refused.data).toMatchObject({ code: 'MODEL_IN_USE' });
+            const before = state.chatAborted;
+            const stopping = post(`/devices/${id}/memory`, { model: 'qwen2.5-coder:7b', stop: true });
+            await wait(60);
+            state.running = [];
+            state.chatHold = false;
+            expect((await stopping).data).toMatchObject({ removed: true });
+            expect(state.chatAborted).toBe(before + 1);
+            await stream.finished;
+        });
+
+        test('a model still loading for a reply is shown as loading', async () => {
+            state.running = [];
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two';
+            state.chatHold = true;
+            const stream = await openStream(chat.id, { content: 'hello' });
+            await stream.until((event) => event.type === 'token');
+            expect((await here()).models).toEqual([expect.objectContaining({ name: 'qwen2.5-coder:7b', state: 'loading', sizeMb: null })]);
+            state.chatHold = false;
+            await stream.finished;
+        });
+
+        test('an idle model is removed, and bad requests are refused', async () => {
+            state.running = [{ name: 'qwen2.5-coder:7b', size: 100, size_vram: 100 }];
+            const { id } = await here();
+            const removing = post(`/devices/${id}/memory`, { model: 'qwen2.5-coder:7b' });
+            for (let tries = 0; tries < 100 && state.unloaded.length === 0; tries += 1) await wait(20);
+            state.running = [];
+            expect((await removing).data).toMatchObject({ success: true, removed: true, computer: { id, models: [] } });
+            expect(state.unloaded).toEqual([{ model: 'qwen2.5-coder:7b', keep_alive: 0 }]);
+
+            expect((await post(`/devices/${id}/memory`, {})).status).toBe(400);
+            expect((await post('/devices/aaaaaaaaaaaaaaaaaaaaaaaa/memory', { model: 'x' })).status).toBe(404);
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/devices/memory')).status).toBeGreaterThanOrEqual(401);
         });
     });
 
@@ -4169,11 +4244,12 @@ describe('Chat endpoints', () => {
                 await send(chat.id, { content: 'find a duck model' });
                 expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator']);
 
-                // Switched off for the chat, the search tools go and the built-in reader is back.
+                // It is always on: a chat that was once switched off searches like any other.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
+                await Chat.updateOne({ _id: quiet.id }, { $set: { webSearch: false } });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name).slice(0, 2)).toEqual(['web_search', 'web_fetch']);
             });
         });
 
@@ -6044,6 +6120,13 @@ describe('Linked devices', () => {
         expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
         expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
 
+        // The memory list shows the pooled model on the primary computer, with who helps, and what the other one lends to.
+        const held = (await client.get('/api/v1/devices/memory')).data;
+        const mainHeld = held.computers.find((one) => one.id === main.id);
+        expect(mainHeld.models).toEqual([expect.objectContaining({ name: 'tiny:1b', source: 'pool', state: 'idle', helpers: ['run-lender'], context: 16384 })]);
+        expect(mainHeld.models[0].idleMs).toBeLessThan(60000);
+        expect(held.computers.find((one) => one.id === lender.id).lending).toMatchObject({ model: 'tiny:1b', main: 'run-main' });
+
         // Nothing is loaded ahead on a computer already running a pooled model.
         expect((await client.client.post('/api/v1/models/load', { name: 'tiny:1b' }, through(main.id))).data.loading).toBe(false);
 
@@ -6058,6 +6141,12 @@ describe('Linked devices', () => {
         const own = (await client.post('/api/v1/chats', { model: 'tiny:1b', device: main.id })).data.chat;
         await client.client.post(`/api/v1/chats/${own.id}/messages`, { content: 'Hello computer' }, { responseType: 'text', validateStatus: () => true });
         expect(mainApp.stops).toBe(1);
+
+        // It can be removed from memory by hand too.
+        mainApp.ws.send(JSON.stringify({ type: 'pool-state', data: { build: 'b12591', role: 'main', setup: 'ready', lending: false, address: null, allow: [], port: 50052, running: 'tiny:1b', detail: null } }));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect((await client.post(`/api/v1/devices/${main.id}/memory`, { model: 'tiny:1b', pooled: true })).data).toMatchObject({ removed: true });
+        expect(mainApp.stops).toBe(2);
 
         // Too little free memory across the pool is said before anything starts there.
         for (const app of [mainApp, lenderApp]) Object.assign(app, { freeMb: 1500, gpuFreeMb: 100 });
