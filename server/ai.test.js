@@ -7,7 +7,7 @@ import TestStartup from '../utils/test.startup.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
-    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
+    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, createCloudClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, fitPool, freeHardware, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -854,6 +854,19 @@ const fakeOllama = (host, signal) => ({
             return answer(typeof state.plan === 'string' ? state.plan : JSON.stringify(state.plan));
         }
         if (request.stream === false) return { message: { role: 'assistant', content: state.chatReply }, done: true };
+        // A call the model was cut off in the middle of, as the online client reports it.
+        if (offered && state.toolPlan[0]?.cut) {
+            const { cut, calls = [], ended = 'length', said = '' } = state.toolPlan.shift();
+            return {
+                abort() {},
+                async *[Symbol.asyncIterator]() {
+                    if (said) yield { message: { role: 'assistant', content: said } };
+                    if (calls.length > 0) yield { message: { tool_calls: calls.map(([name, args]) => ({ function: { name, arguments: args } })) } };
+                    yield { message: { tool_cut: cut } };
+                    yield { message: { role: 'assistant', content: '' }, done: true, done_reason: ended, eval_count: 3, prompt_eval_count: 20, total_duration: 2e8, eval_duration: 1e8 };
+                }
+            };
+        }
         if (offered && state.toolPlan.length > 0) {
             const calls = state.toolPlan.shift().map(([name, args]) => ({ function: { name, arguments: args } }));
             if (state.toolsAsText) {
@@ -5153,6 +5166,172 @@ describe('Chat endpoints', () => {
             }
         });
 
+        describe('A program too long for the room left', () => {
+            const ran = [];
+            let exits = [];
+            const withSandbox = async (work) => {
+                process.env.SANDBOX_API_KEY = 'rnd_test';
+                process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+                process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+                ran.length = 0;
+                exits = [];
+                let code = '';
+                setSandboxClient({
+                    create: async () => ({ id: 'sbx-1', status: 'running' }),
+                    exec: async (id, line) => {
+                        const runs = line.includes('timeout');
+                        if (runs) ran.push(code);
+                        const exit = runs ? exits.shift() ?? 0 : 0;
+                        const events = [...(exit ? [{ type: 'output', stream: 'stderr', data: 'SyntaxError: invalid syntax\n' }] : []), { type: 'exit', exit_code: exit }];
+                        return (async function* () { yield* events; })();
+                    },
+                    upload: async (id, where, data) => { code = Buffer.from(data).toString(); },
+                    download: async () => ({ data: Buffer.from('') }),
+                    terminate: async () => {}
+                });
+                try {
+                    await work(await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] }));
+                } finally {
+                    await releaseSandboxes();
+                    setSandboxClient(null);
+                    state.toolPlan = [];
+                    delete process.env.SANDBOX_API_KEY;
+                    delete process.env.SANDBOX_WORKSPACE_ID;
+                    delete process.env.SANDBOX_SNAPSHOT;
+                }
+            };
+            const turn = async (chat, plan) => {
+                state.toolPlan = plan;
+                state.chatCalls.length = 0;
+                const { events } = await send(chat.id, { content: 'draw it' });
+                return { events, steps: events.at(-1).reply?.steps || [], asked: state.chatCalls.map((call) => call.messages.at(-1).content) };
+            };
+
+            test('a call cut off in the middle is never run: what there is of the program is kept and the model goes on from there', async () => {
+                await withSandbox(async (chat) => {
+                    const half = JSON.stringify({ language: 'python', code: 'a = 1\nb = 2\nprint(a +' }).slice(0, -2);
+                    const { steps, asked, events } = await turn(chat, [
+                        { cut: { name: 'run_program', text: half }, said: 'Here goes.' },
+                        { cut: { name: 'change_program', text: '{"add":"c = 3\\nd = ' } },
+                        [['change_program', { add: 'print(a + b + c)\n' }]]
+                    ]);
+                    // Nothing ran until the program was whole, and it was sent once, in three parts.
+                    expect(ran).toEqual(['a = 1\nb = 2\nc = 3\nprint(a + b + c)\n']);
+                    expect(asked[1]).toMatch(/^Your call to run_program was cut off because you ran out of room, and it was not run\. The program is kept as far as you got: 2 lines, ending with\n\na = 1\nb = 2\n\nDo not write it again\. Go on with change_program/);
+                    expect(asked[2]).toMatch(/3 lines, ending with\n\na = 1\nb = 2\nc = 3/);
+                    expect(steps.map((step) => [step.tool, step.input, step.failed])).toEqual([['Program', '2 lines so far', null], ['Program', '3 lines so far', null], ['Program', 'a change to the program', null]]);
+                    expect(events.at(-1).type).toBe('done');
+                });
+            });
+
+            test('a program is mended by sending only what changes, read by its lines, and written in parts', async () => {
+                await withSandbox(async (chat) => {
+                    exits = [1];
+                    const first = await turn(chat, [
+                        [['run_program', { language: 'python', code: 'x = 1\nprint(x\n' }]],
+                        [['change_program', { change: [{ find: 'print(y', replace: 'print(x)' }] }]],
+                        [['change_program', { show: '2-9' }]],
+                        [['change_program', { change: [{ find: 'print(x', replace: 'print(x)' }] }]]
+                    ]);
+                    expect(ran).toEqual(['x = 1\nprint(x\n', 'x = 1\nprint(x)\n']);
+                    expect(first.asked[1]).toMatch(/SyntaxError: invalid syntax[\s\S]*The program is kept\. To mend it, send only what changes with change_program\.$/);
+                    expect(first.asked[2]).toMatch(/^Nothing was changed or run\. The find text of change 1 is not in the program\./);
+                    expect(first.asked[3]).toBe('Lines 2 to 2 of 2:\nprint(x');
+
+                    // It is still there for the next message, and a text that occurs twice is not guessed at.
+                    const second = await turn(chat, [
+                        [['change_program', { change: [{ find: 'x', replace: 'z' }] }]],
+                        [['run_program', { language: 'node', code: 'const a = 1;', unfinished: true }]],
+                        [['change_program', { add: 'const b = 2;', unfinished: true }]],
+                        [['change_program', { add: 'console.log(a + b);' }]]
+                    ]);
+                    expect(second.asked[1]).toMatch(/occurs 2 times/);
+                    expect(second.asked[2]).toMatch(/^Kept, not run yet\. The program has 1 lines so far/);
+                    expect(ran.at(-1)).toBe('const a = 1;\nconst b = 2;\nconsole.log(a + b);');
+                    expect(ran).toHaveLength(3);
+
+                    // Nothing to change in a chat that has no program.
+                    const other = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] });
+                    expect((await turn(other, [[['change_program', { add: 'x' }]]])).asked[1]).toMatch(/^There is no program in this chat to change/);
+                });
+            });
+
+            test('the same failing call is not run a third time, and other work is not held back', async () => {
+                await withSandbox(async (chat) => {
+                    const { asked, steps } = await turn(chat, [[['run_program', {}]], [['run_program', {}]], [['run_program', {}]], [['run_program', { language: 'bash', code: 'ls' }]]]);
+                    expect(asked[2]).toMatch(/^Nothing was run\. Say what the program is written in/);
+                    expect(asked[3]).toMatch(/^This exact call has failed 2 times and was not run again: it would fail the same way\. Do something different\.\n\nNothing was run\./);
+                    expect(steps.map((step) => step.failed)).toEqual(['failed', 'failed', 'failed', null]);
+                    expect(ran).toEqual(['ls']);
+                });
+            });
+
+            test('a call that cannot be kept in part is asked for again, shorter, and gives up only when nothing helps', async () => {
+                await withSandbox(async (chat) => {
+                    const cut = { cut: { name: 'save_to_files', text: '{"folder":"/x","content":"long' } };
+                    const once = await turn(chat, [cut]);
+                    expect(once.asked[1]).toBe('Your call to save_to_files was cut off because you ran out of room, and it was not run. Call it again with less in it, or leave out what it can do without.');
+                    expect(once.steps).toEqual([expect.objectContaining({ input: 'cut off', failed: 'cut' })]);
+                    expect(once.events.at(-1).type).toBe('done');
+
+                    const never = await turn(chat, [cut, cut, cut, cut]);
+                    expect(never.events.at(-1)).toMatchObject({ type: 'error', code: 'REPLY_CUT' });
+                    expect(state.toolPlan).toHaveLength(1);
+
+                    // Not cut for want of room, but not readable either.
+                    const unread = await turn(chat, [{ ...cut, ended: 'stop' }]);
+                    expect(unread.asked[1]).toMatch(/was not complete, so it could not be read, and it was not run/);
+
+                    // Whole calls made beside the cut one are run, and the model is told about the other.
+                    const both = await turn(chat, [{ ...cut, calls: [['calculator', { expression: '6 * 7' }]] }]);
+                    expect(state.chatCalls[1].messages.at(-2)).toMatchObject({ role: 'tool' });
+                    expect(both.asked[1]).toMatch(/^Your call to save_to_files was cut off/);
+                });
+            });
+
+            test('earlier versions of a program make room before anything else does, and the last one stays', async () => {
+                const usual = state.contextLength;
+                try {
+                    state.contextLength = 8192;
+                    await withSandbox(async (chat) => {
+                        const long = (n) => `# version ${n}\n${'print("a line of the program")\n'.repeat(250)}`;
+                        await turn(chat, [1, 2, 3].map((n) => [['run_program', { language: 'python', code: long(n) }]]));
+                        const codes = state.chatCalls.at(-1).messages.flatMap((message) => message.tool_calls || []).map((call) => call.function.arguments.code);
+                        expect(codes[0]).toMatch(/^\[An earlier version of this program, [\d,]+ characters, put away to save room\./);
+                        expect(codes[2]).toBe(long(3));
+                        expect(ran).toHaveLength(3);
+                    });
+                } finally {
+                    state.contextLength = usual;
+                }
+            });
+
+            test('the online and pooled client passes on whole calls only, and what there is of a cut one', async () => {
+                const answer = (pieces, finish) => async () => new Response([...pieces.map((call) => ({ choices: [{ delta: { tool_calls: [call] } }] })), { choices: [{ delta: {}, finish_reason: finish }] }].map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', { status: 200 });
+                const read = async (pieces, finish) => {
+                    const parts = [];
+                    const cloud = createCloudClient({ id: 'pool', type: 'openai', base: 'http://pool.test', fetch: answer(pieces, finish) }, 'x');
+                    for await (const part of await cloud.chat({ model: 'm', stream: true, messages: [{ role: 'user', content: 'x' }], options: {} })) parts.push(part);
+                    return { calls: parts.flatMap((part) => part.message?.tool_calls || []).map((call) => call.function), cut: parts.find((part) => part.message?.tool_cut)?.message.tool_cut || null };
+                };
+                const call = (index, name, text) => ({ index, function: { name, arguments: text } });
+                expect(await read([call(0, 'run_program', '{"code":"print(')], 'length')).toEqual({ calls: [], cut: { name: 'run_program', text: '{"code":"print(' } });
+                expect(await read([call(0, 'run_program', '{"code":"x"}')], 'length')).toMatchObject({ calls: [], cut: { name: 'run_program' } });
+                expect(await read([call(0, 'calculator', '{"expression":"1"}'), call(1, 'run_program', '{"co')], 'length')).toMatchObject({ calls: [{ name: 'calculator', arguments: { expression: '1' } }], cut: { name: 'run_program' } });
+                expect(await read([call(0, 'calculator', '{"expression":"1"}')], 'tool_calls')).toEqual({ calls: [{ name: 'calculator', arguments: { expression: '1' } }], cut: null });
+                expect(await read([call(0, 'date_time', '')], 'tool_calls')).toEqual({ calls: [{ name: 'date_time', arguments: {} }], cut: null });
+            });
+
+            test('cutInput reads an input as far as it got, whatever it was cut in the middle of', () => {
+                expect(cutInput('{"language":"python","code":"a\\n\\"b\\"', 'code')).toBe('a\n"b"');
+                expect(cutInput('{"code":"tail\\', 'code')).toBe('tail');
+                expect(cutInput('{"code":"caf\\u00e', 'code')).toBe('caf');
+                expect(cutInput('{"code":"path C:\\\\', 'code')).toBe('path C:\\');
+                expect(cutInput('{"code":"two\nlines', 'code')).toBe('two\nlines');
+                expect(cutInput('{"language":"python"', 'code')).toBeNull();
+            });
+        });
+
         test('Visual Explainer renders in a sandbox, goes back once to be fixed, shows in the app\'s theme with its kit named not pasted, and a long page is not sent back to the model', async () => {
             const kitFile = (name) => fs.readFileSync(new URL(`../../server/instructions/library/explainer/explainer-visual-explainer/kit/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
             const css = kitFile('kit.css');
@@ -5847,7 +6026,7 @@ describe('Linked devices', () => {
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
             const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? (app.tags || TAGS) : message.path === '/api/ps' ? { models: app.running || [] }
-                : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: { 'llama.context_length': 8192 }, details: {} } : null;
+                : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: app.info || { 'llama.context_length': 8192 }, details: {} } : null;
             if (!body) {
                 const notFound = () => {
                     send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
@@ -6060,6 +6239,15 @@ describe('Linked devices', () => {
         await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
     });
 
+    test('the memory a conversation takes is worked out from the model\'s own facts, or not at all', () => {
+        const info = { 'general.architecture': 'llama', 'llama.block_count': 32, 'llama.embedding_length': 4096, 'llama.attention.head_count': 32, 'llama.attention.head_count_kv': 8 };
+        // 32 layers, 8 heads, 256 numbers a head, a little over a byte each.
+        expect(conversationMb(info, 16384)).toBe(Math.ceil((32 * 8 * 256 * 1.0625 * 16384) / MB));
+        expect(conversationMb({ ...info, 'llama.attention.key_length': 64, 'llama.attention.value_length': 64 }, 16384)).toBe(Math.ceil((32 * 8 * 128 * 1.0625 * 16384) / MB));
+        expect(conversationMb({ 'general.architecture': 'llama' }, 16384)).toBeNull();
+        expect(conversationMb(null, 16384)).toBeNull();
+    });
+
     test('a lending computer on another llama.cpp build than the main computer is told why it cannot pool', async () => {
         await testStartup.loginAsUser('admin');
         const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Wi-Fi', wired: false }] });
@@ -6148,6 +6336,21 @@ describe('Linked devices', () => {
         expect((await client.post(`/api/v1/devices/${main.id}/memory`, { model: 'tiny:1b', pooled: true })).data).toMatchObject({ removed: true });
         expect(mainApp.stops).toBe(2);
 
+        // With every computer saying what is free and room to spare, a model that can read more is started with more.
+        for (const app of [mainApp, lenderApp]) Object.assign(app, { freeMb: 30000, gpuFreeMb: null, info: { 'general.architecture': 'llama', 'llama.context_length': 131072, 'llama.block_count': 16, 'llama.embedding_length': 2048, 'llama.attention.head_count': 16, 'llama.attention.head_count_kv': 4 } });
+        await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'More room' }, { responseType: 'text', validateStatus: () => true });
+        expect(mainApp.runs.at(-1)).toMatchObject({ model: 'tiny:1b', ctx: 32768 });
+        expect((await client.get('/api/v1/devices/memory')).data.computers.find((one) => one.id === main.id).models[0].context).toBe(32768);
+        await client.post(`/api/v1/devices/${main.id}/memory`, { model: 'tiny:1b', pooled: true });
+        // When that start fails, the next one asks for less.
+        mainApp.runError = 'out of memory';
+        const wide = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Too much' }, { responseType: 'text', validateStatus: () => true });
+        expect(String(wide.data)).toMatch(/out of memory Send your message again: it will start with less room\./);
+        mainApp.runError = null;
+        await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Less' }, { responseType: 'text', validateStatus: () => true });
+        expect(mainApp.runs.slice(-2).map((run) => run.ctx)).toEqual([32768, 16384]);
+        await client.post(`/api/v1/devices/${main.id}/memory`, { model: 'tiny:1b', pooled: true });
+
         // Too little free memory across the pool is said before anything starts there.
         for (const app of [mainApp, lenderApp]) Object.assign(app, { freeMb: 1500, gpuFreeMb: 100 });
         const before = mainApp.runs.length;
@@ -6179,7 +6382,7 @@ describe('Linked devices', () => {
         // Stop while the pool is still starting the model ends the reply at once, without waiting for the start.
         mainApp.holdRun = true;
         const slow = client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Slow start' }, { responseType: 'text', validateStatus: () => true });
-        for (let tries = 0; tries < 60 && mainApp.runs.length < 4; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        for (let tries = 0; tries < 60 && mainApp.runs.length < 7; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
         const pressed = Date.now();
         await client.post(`/api/v1/chats/${made.data.chat.id}/stop`);
         await slow;
@@ -7246,7 +7449,7 @@ describe('Online model providers', () => {
                 const last = body.messages.at(-1);
                 const wanted = typeof last?.content === 'string' && last.content.includes('Work it out');
                 if (body.tools && wanted) {
-                    const cut = last.content.includes('cut');
+                    const cut = last.content.includes('gets cut');
                     const calling = [
                         ['message_start', { type: 'message_start', message: { id: 'msg_2', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 30, output_tokens: 1 } } }],
                         ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
@@ -7504,11 +7707,12 @@ describe('Online model providers', () => {
         // Cut off at the length limit, the half-written call is not run; the model is asked to go on instead.
         asked.length = 0;
         const cut = await say('Work it out, but this one gets cut');
-        expect(cut.some((event) => event.type === 'tool')).toBe(false);
-        // First it is given more room and asked again, which is cut the same way; then it is asked to go on.
+        expect(cut.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: 'cut off' });
+        expect(cut.find((event) => event.type === 'toolFailed')).toMatchObject({ failed: 'cut' });
+        // It is told at once, and asked again.
         const calls = asked.filter((one) => one.path === '/v1/messages');
-        expect(calls).toHaveLength(3);
-        expect(JSON.stringify(calls[2].body.messages.at(-1))).toContain('Go on from exactly where you stopped');
+        expect(calls).toHaveLength(2);
+        expect(JSON.stringify(calls[1].body.messages.at(-1))).toContain('Your call to calculator was cut off because you ran out of room, and it was not run.');
     });
 
     test('a key that stops working mid-use ends the reply with a plain reason', async () => {
