@@ -5136,6 +5136,251 @@ describe('Chat endpoints', () => {
             }
         });
 
+        test('the Anatomy build runs the model\'s build script beside the skill\'s kit in a sandbox, opens the page it writes and shows it in the app\'s colours', async () => {
+            const example = fs.readFileSync(new URL('../../server/instructions/library/anatomy/anatomy-anatomy/examples/dial-indicator/build.mjs', import.meta.url), 'utf8').replace(/\r\n/g, '\n').trim();
+            const page = '<!doctype html><html><head><title>Dial</title></head><body class="iso"><g class="iso-solid"></g><g class="iso-solid"></g><g class="iso-solid"></g><path class="iso-line" d="M0 0"/></body></html>';
+            const clean = 'PAGE dial-indicator.html\nPROBE {"errors":[],"drawn":362,"bad":false}\nline ends: 0 of 367 ends on 23 lines float\n';
+            const uploads = [];
+            const ended = [];
+            const outs = [];
+            let last = null;
+
+            // Without sandboxes nothing can run the script, so the function is not offered.
+            const without = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy'] });
+            state.chatCalls.length = 0;
+            await send(without.id, { content: 'hello' });
+            expect((state.chatCalls[0].tools || []).map((tool) => tool.function.name)).not.toContain('anatomy_build');
+
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async () => ({ id: `sbx-${ended.length + 1}`, status: 'running' }),
+                exec: async (id, line) => {
+                    let events = [{ type: 'exit', exit_code: 0 }];
+                    if (line.includes('timeout')) {
+                        last = outs.shift() || { out: clean };
+                        events = [{ type: 'output', stream: 'stdout', data: last.out }, { type: 'exit', exit_code: last.exit || 0 }];
+                    } else if (line.startsWith('cd /root/work && find')) {
+                        events = [{ type: 'output', stream: 'stdout', data: last?.exit ? '' : 'page.html\n' }, { type: 'exit', exit_code: 0 }];
+                    }
+                    return (async function* () { yield* events; })();
+                },
+                upload: async (id, where, data) => { uploads.push({ where, data: Buffer.from(data).toString() }); },
+                download: async () => ({ data: Buffer.from(page) }),
+                terminate: async (id) => { ended.push(id); }
+            });
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy'] });
+                const turn = async (plan) => {
+                    state.chatCalls.length = 0;
+                    state.toolPlan = plan.map((call) => [call]);
+                    const { events } = await send(chat.id, { content: 'draw it' });
+                    return { told: plan.map((call, at) => state.chatCalls[at + 1].messages.at(-1).content), reply: events.at(-1).reply.content };
+                };
+
+                // The script goes into the skill's own examples folder, so it imports the kit as the examples do, and
+                // the page it writes is opened in the browser and given the skill's own line check.
+                const first = await turn([['anatomy_build', { code: example }]]);
+                expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(['anatomy_build', 'anatomy_change']));
+                expect(uploads.find((one) => one.where === '/root/work/build.mjs').data).toBe(example + '\n');
+                const job = uploads.find((one) => one.where === '/root/job/main.sh').data;
+                expect(job).toContain('there=$home/examples/figure');
+                expect(job).toContain('node build.mjs');
+                expect(job).toContain('chromium --headless');
+                expect(job).toContain('node $home/scripts/lines.mjs page.html');
+                expect(ended).toEqual(['sbx-1']);
+                expect(first.told[0]).toBe('Built dial-indicator.html and showed it to the user in the chat, in the app\'s colours. It draws 3 solids and 1 lines. It was opened in a browser, the pointer was moved across it, and it ran without errors. The line check found no floating ends. You cannot see the page from here, so the close-ups the skill asks for have not been done.');
+                // The page is shown whole, with the kit's tones worked out from the app's theme.
+                expect(first.reply.match(/<Frame height="560px" title="Anatomy dial-indicator">/g)).toHaveLength(1);
+                expect(first.reply).toContain('--anatomy-paper:var(--app-surface,light-dark(#fbfbfa,#131313));');
+                expect(first.reply).toContain('<g class="iso-solid">');
+
+                // A figure drawn without the kit is not run at all.
+                const sent = uploads.length;
+                const flat = await turn([['anatomy_build', { code: 'import fs from "node:fs";\nfs.writeFileSync("page.html", "<svg></svg>");' }]]);
+                expect(flat.told[0]).toMatch(/^Nothing was built\. An Anatomy figure is drawn with the skill's kit\./);
+                expect(uploads).toHaveLength(sent);
+
+                // A script that fails says where, without the sandbox's own paths, and what the kit has; it is mended
+                // by sending only what changes, and the mended script is what runs.
+                outs.push({ exit: 3, out: 'BUILD 1\nfile:///root/skills/anatomy/examples/figure/build.mjs:62\n  out.push(S(k.slab(PLATE)));\n\nTypeError: k.slab is not a function\n    at plate (file:///root/skills/anatomy/examples/figure/build.mjs:62:16)\n    at ModuleJob.run (node:internal/modules/esm/module_job:569:25)\n\nNode.js v22.11.0\n' });
+                const mended = await turn([['anatomy_build', { code: example }], ['anatomy_change', { change: [{ find: 'const WIDTH = 600;', replace: 'const WIDTH = 640;' }] }]]);
+                expect(mended.told[0]).toMatch(/^Nothing was shown: the build script failed\.\nbuild\.mjs:62\n {2}out\.push\(S\(k\.slab\(PLATE\)\)\);\n\nTypeError: k\.slab is not a function\n {4}at plate \(build\.mjs:62:16\)\nMend it with anatomy_change, sending only the lines that change\.\n\nWhat kit\/iso-kit\.mjs exports \(nothing else is in it\): /);
+                expect(mended.told[0]).toContain('slabOf');
+                expect(mended.told[0]).not.toMatch(/ModuleJob|Node\.js v/);
+                expect(mended.told[1]).toMatch(/^Built dial-indicator\.html and showed it/);
+                expect(uploads.filter((one) => one.where === '/root/work/build.mjs').at(-1).data).toContain('const WIDTH = 640;');
+                expect(mended.reply.match(/<Frame /g)).toHaveLength(1);
+
+                // A floating line goes back once and is shown the second time with what is left.
+                const floating = 'PAGE dial-indicator.html\nPROBE {"errors":[],"drawn":362,"bad":false}\nline ends: 1 of 367 ends on 23 lines float\n  needle  end  nothing nearby\nconsole: clean\n';
+                outs.push({ out: floating }, { out: floating });
+                const loose = await turn([['anatomy_build', { code: example }], ['anatomy_build', { code: `${example}\n// again` }]]);
+                expect(loose.told[0]).toMatch(/^Not shown yet\. 1 to fix in dial-indicator\.html:\nlines: line ends: 1 of 367 ends on 23 lines float\n {2}needle {2}end {2}nothing nearby\nEvery line ends on a stroke/);
+                expect(loose.told[1]).toMatch(/^Built dial-indicator\.html and showed it to the user in the chat, with 1 still to fix:\nlines: /);
+
+                // A page that fails when it is opened is never shown, and the person is told so in its place.
+                const failing = { out: 'PAGE dial-indicator.html\nPROBE {"errors":["Uncaught TypeError: needle.nope is undefined"],"drawn":362,"bad":false}\n' };
+                outs.push(failing, failing);
+                const broken = await turn([['anatomy_build', { code: `${example}\n// one` }], ['anatomy_build', { code: `${example}\n// two` }]]);
+                expect(broken.told[1]).toMatch(/^Not shown yet\. 1 to fix in dial-indicator\.html:\nrun: the figure fails when it is opened in a browser: Uncaught TypeError: needle\.nope is undefined/);
+                expect(broken.reply).not.toContain('<Frame ');
+                expect(broken.reply).toContain('_The figure “dial-indicator” is not shown: it did not work when it was opened._');
+            } finally {
+                state.toolPlan = [];
+                setSandboxClient(null);
+                // These builds are many calls for one test person: the hourly count starts again for the tests after.
+                setToolCallLimit(null);
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
+            }
+        });
+
+        test('CadSmith scripts are run on the chat\'s computer, measured, shown in the 3D viewer and offered for saving; a drawing is read for Hairline; an office file is checked', async () => {
+            const facts = (models, more = {}) => `CAD ${JSON.stringify({ status: null, models, parts: 0, preview: 'cad-preview.obj', note: '', ...more })}\n`;
+            const solid = { file: 'bracket.stl', triangles: 3080, bodies: 1, size: [80, 40, 36], watertight: true, volume: 25859.571 };
+            const obj = ['v 0 0 0', 'v 1 0 0', 'v 0 1 0', ...Array.from({ length: 700 }, (unused, at) => `v ${at} 0 1`), 'f 1 2 3'].join('\n');
+            const script = 'from build123d import *\nwidth = 40\nresult = Box(80, width, 6)\nexport_step(result, "./output/bracket.step")\nexport_stl(result, "./output/bracket.stl")';
+            const uploads = [];
+            const made = [];
+            const outs = [];
+            let last = null;
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async (options) => { made.push(options); return { id: `sbx-${made.length}`, status: 'running' }; },
+                exec: async (id, line) => {
+                    let events = [{ type: 'exit', exit_code: 0 }];
+                    if (line.includes('timeout')) {
+                        last = outs.shift() || { out: '' };
+                        events = [{ type: 'output', stream: 'stdout', data: last.out || '' }, ...(last.err ? [{ type: 'output', stream: 'stderr', data: last.err }] : []), { type: 'exit', exit_code: last.exit || 0 }];
+                    } else if (line.startsWith('cd /root/work && find')) {
+                        events = [{ type: 'output', stream: 'stdout', data: (last?.files || []).map((one) => `${one}\n`).join('') }, { type: 'exit', exit_code: 0 }];
+                    }
+                    return (async function* () { yield* events; })();
+                },
+                upload: async (id, where, data) => { uploads.push({ id, where, data: Buffer.from(data).toString() }); },
+                download: async (id, where) => ({ data: Buffer.from(where.endsWith('cad-preview.obj') ? obj : `content of ${where}`) }),
+                terminate: async () => {}
+            });
+            setFilesFetch(fakeFilesystemOne);
+            try {
+                const turn = async (chat, plan) => {
+                    state.chatCalls.length = 0;
+                    state.toolPlan = plan.map((call) => [call]);
+                    const { events } = await send(chat.id, { content: 'make it' });
+                    return { told: plan.map((call, at) => state.chatCalls[at + 1].messages.at(-1).content), reply: events.at(-1).reply.content, events, tools: state.chatCalls[0].tools.map((tool) => tool.function.name) };
+                };
+                const built = ['cad-preview.obj', 'output/bracket.py', 'output/bracket.step', 'output/bracket.stl'];
+
+                // Two CadSmith skills on: their shared functions are offered once each.
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'cadsmith-make-model', 'cadsmith-edit-model'] });
+                outs.push({ out: `bracket volume 25859.4\n${facts([solid])}`, files: built });
+                const first = await turn(chat, [['cad_build', { code: script, name: 'Bracket.py' }]]);
+                expect(first.tools.filter((name) => name === 'cad_build')).toHaveLength(1);
+                expect(first.tools).toEqual(expect.arrayContaining(['cad_change', 'cad_export']));
+                // The script goes to the chat's own computer under its name, with the driver that runs and measures it.
+                expect(uploads.find((one) => one.where === '/root/work/bracket.py').data).toBe(script + '\n');
+                const driver = uploads.find((one) => one.where === '/root/job/main.py').data;
+                expect(driver).toContain('NAME = "bracket"');
+                expect(driver).toContain('MODE = "model"');
+                expect(driver).toContain('runpy.run_path(src, run_name=\'__main__\')');
+                expect(first.told[0]).toMatch(/^Built bracket and showed it to the user in the chat's 3D viewer\.\n\nbracket\.stl: 1 body, 80 × 40 × 36 \(x × y × z\), volume 25,859\.57, watertight, 3,080 triangles\.\n\nIt printed:\nbracket volume 25859\.4\n\nIt made bracket\.py, bracket\.step, bracket\.stl\. The user is being asked whether to save them in \/.*CadSmith/);
+                expect(first.reply).toContain('```component\n<Model3D format="obj" fileName="bracket.obj">\nv 0 0 0\nv 1 0 0\nv 0 1 0\n');
+                expect(first.reply).toContain('\nf 1 2 3\n</Model3D>\n```');
+                expect(first.events.find((event) => event.type === 'toolSave').save.names).toEqual(['bracket.py', 'bracket.step', 'bracket.stl']);
+
+                // A script that fails says why and is mended by sending only what changes; the newer model takes the
+                // older one's place, and the same computer is used again.
+                outs.push({ exit: 1, out: '', err: 'Traceback (most recent call last):\n  File "output/bracket.py", line 3, in <module>\nValueError: Failed creating a fillet with radius of 4' }, { out: facts([{ ...solid, size: [80, 50, 36] }]), files: built });
+                const mended = await turn(chat, [['cad_build', { code: script.replace('Box(80, width, 6)', 'fillet(Box(80, width, 6).edges(), 4)'), name: 'bracket' }], ['cad_change', { change: [{ find: 'width = 40', replace: 'width = 50' }, { find: 'fillet(Box(80, width, 6).edges(), 4)', replace: 'Box(80, width, 6)' }] }]]);
+                expect(mended.told[0]).toMatch(/^Nothing was shown: the script failed\.\n\nErrors:\nTraceback \(most recent call last\):\n {2}File "output\/bracket\.py", line 3, in <module>\nValueError: Failed creating a fillet with radius of 4\n\nThe script is kept\. Mend it with cad_change, sending only the lines that change\./);
+                expect(mended.told[1]).toMatch(/^Built bracket and showed it .*\n\nbracket\.stl: 1 body, 80 × 50 × 36/);
+                expect(uploads.filter((one) => one.where === '/root/work/bracket.py').at(-1).data).toContain('width = 50');
+                expect(mended.reply.match(/<Model3D /g)).toHaveLength(1);
+                expect(made).toHaveLength(1);
+
+                // A model with open edges goes back once with its measurements, and is shown the second time.
+                const open = { ...solid, watertight: false, volume: null, bodies: 2 };
+                outs.push({ out: facts([open]), files: built }, { out: facts([open]), files: built });
+                const leaky = await turn(chat, [['cad_build', { code: script, name: 'bracket' }], ['cad_build', { code: `${script}\n# again`, name: 'bracket' }]]);
+                expect(leaky.told[0]).toMatch(/^Not shown yet\. 1 to fix in bracket:\nbracket\.stl is not watertight: .*\nbracket\.stl: 2 separate bodies, 80 × 40 × 36 \(x × y × z\), no volume, because it is NOT watertight, 3,080 triangles\.\nThe script is kept\./);
+                expect(leaky.told[1]).toMatch(/^Built bracket and showed it to the user in the chat's 3D viewer, with 1 still to fix\./);
+
+                // A script that is not a CAD script is not run, and one that exports nothing shows nothing.
+                const sent = uploads.length;
+                outs.push({ out: facts([], { preview: null }), files: ['output/bracket.py'] });
+                const none = await turn(chat, [['cad_build', { code: 'print("a bracket")', name: 'bracket' }], ['cad_build', { code: 'from build123d import *\nresult = Box(1, 1, 1)', name: 'bracket' }]]);
+                expect(none.told[0]).toMatch(/^Nothing was run\. A CadSmith model is a build123d or CadQuery script/);
+                expect(none.told[1]).toMatch(/^Nothing was shown: the script ran but exported no model\. End it with export_step\(result, "\.\/output\/bracket\.step"\) and export_stl\(result, "\.\/output\/bracket\.stl"\)\./);
+                expect(uploads.length).toBeGreaterThan(sent);
+
+                // Another kind of file is made from the model on the same computer and offered too.
+                outs.push({ out: 'EXPORTED output/bracket.glb 56312 3080\n', files: ['output/bracket.glb'] });
+                const exported = await turn(chat, [['cad_export', { name: 'bracket', format: 'glb' }]]);
+                expect(exported.told[0]).toMatch(/^Exported bracket\.glb: 3,080 triangles, 56,312 bytes\.\n\nIt made bracket\.glb\. The user is being asked/);
+                expect(uploads.filter((one) => one.where === '/root/job/main.py').at(-1).data).toContain('FORMAT = "glb"');
+
+                // An earlier model in the conversation is sent back to the model as one line.
+                state.chatCalls.length = 0;
+                state.toolPlan = [];
+                await send(chat.id, { content: 'thanks' });
+                expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('v 1 0 0');
+                expect(state.chatCalls[0].messages.map((message) => message.content).join('\n')).toMatch(/\[Shown here: "bracket\.obj", a 3D model of [\d,]+ characters, not repeated\.\]/);
+
+                // A mechanism is run with the skill's own command and its summary comes back word for word, without
+                // the line that points at a viewer that is not here.
+                const moving = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'cadsmith-make-mechanism'] });
+                const summary = 'mech four_bar — PASS   4 parts · 3 joints (1 driver, 2 passive)\nΔprev: first run\nview: exported outside <repo>/output · shot: uv run mech shot four_bar\n';
+                outs.push({ out: summary + facts([], { status: 0, parts: 4 }), files: ['cad-preview.obj', 'output/four_bar.py', 'output/four_bar.mech/assembly.step', 'output/four_bar.mech/parts/crank.stl', 'output/four_bar.mech/scene.json'] });
+                const ran = await turn(moving, [['mech_run', { code: 'from mech import *\ndef build():\n    pass\nrun(build())', name: 'four_bar', params: 'crank=35 gap=0.4 x=$(rm) -rf' }]]);
+                expect(ran.tools).toEqual(expect.arrayContaining(['mech_run', 'cad_change']));
+                expect(ran.tools).not.toContain('cad_build');
+                const runner = uploads.filter((one) => one.where === '/root/job/main.py').at(-1).data;
+                expect(runner).toContain('MODE = "mechanism"');
+                expect(runner).toContain('PARAMS = ["crank=35","gap=0.4"]');
+                expect(runner).toContain('RUN + [src, \'--output-dir\', \'output\', \'--step\']');
+                expect(ran.told[0]).toMatch(/^Ran four_bar and showed it to the user in the chat's 3D viewer, 4 parts at the home pose\. The summary:\n\nmech four_bar — PASS {3}4 parts · 3 joints \(1 driver, 2 passive\)\nΔprev: first run\n\nIt made four_bar\.py, four_bar\.mech\/assembly\.step\./);
+                expect(ran.told[0]).not.toContain('mech shot');
+
+                // Hairline Adopt is gone: Hairline Create reads the drawing itself, with the skill's own read.mjs.
+                expect((await get('/skills')).data.skills.map((skill) => skill.id)).not.toContain('hairline-hairline-adopt');
+                const drawing = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+                outs.push({ out: 'picture /root/work/hairline-source-source.png\ncard /root/work/hairline-source-source.txt\nviewBox 0 0 24 24\n2 shapes\n', files: ['hairline-source-source.png', 'hairline-source-source.txt'] });
+                const read = await turn(drawing, [['hairline_read', { svg: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/></svg>' }], ['hairline_read', { svg: 'a circle' }]]);
+                expect(uploads.find((one) => one.where === '/root/work/source.svg').data).toContain('<circle');
+                expect(uploads.filter((one) => one.where === '/root/job/main.sh').at(-1).data).toBe('node /root/skills/hairline-create/read.mjs source.svg --name source 2>&1');
+                expect(read.told[0]).toMatch(/^picture hairline-source-source\.png\ncard hairline-source-source\.txt\nviewBox 0 0 24 24\n2 shapes\n\nThe picture of the drawing is attached\. source\.md says how to read the card\./);
+                expect(read.told[1]).toMatch(/^Nothing was read\. Give the SVG as text/);
+
+                // A Word file a program made is checked with its skill's own script on the same computer, and what the
+                // script says is added to the result; a fault makes the step one to mend.
+                const office = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anthropic-docx'] });
+                outs.push({ out: 'made it\n', files: ['report.docx'] }, { out: '=== 0 0\nAll validations PASSED!\n', files: [] });
+                const fine = await turn(office, [['run_program', { language: 'python', code: 'print("made it")' }]]);
+                expect(uploads.filter((one) => one.where === '/root/job/main.sh').at(-1).data).toBe('out=$(python /root/skills/docx/scripts/office/validate.py \'report.docx\' 2>&1); echo "=== 0 $?"; echo "$out" | tail -c 2500');
+                expect(fine.told[0]).toMatch(/^The python program finished with exit code 0\.[\s\S]*\n\nreport\.docx, checked with DOCX's scripts\/office\/validate\.py:\nAll validations PASSED!$/);
+                outs.push({ out: 'made it\n', files: ['report.docx'] }, { out: '=== 0 1\nword/document.xml: an element is out of order\n', files: [] });
+                const faulty = await turn(office, [['run_program', { language: 'python', code: 'print("made it again")' }]]);
+                expect(faulty.told[0]).toContain('report.docx, checked with DOCX\'s scripts/office/validate.py: it has faults to fix.\nword/document.xml: an element is out of order');
+                expect(faulty.told[0]).toContain('The program is kept. To mend it, send only what changes with change_program.');
+                expect(faulty.events.find((event) => event.type === 'toolFailed')).toBeTruthy();
+            } finally {
+                state.toolPlan = [];
+                setSandboxClient(null);
+                // These builds are many calls for one test person: the hourly count starts again for the tests after.
+                setToolCallLimit(null);
+                setFilesFetch(null);
+                await releaseSandboxes();
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
+            }
+        });
+
         test('a program the model writes runs in a sandbox with no network, on the person\'s files, once they allow it, and the sandbox is always thrown away', async () => {
             const made = [];
             const uploads = [];
