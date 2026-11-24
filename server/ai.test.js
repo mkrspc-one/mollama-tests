@@ -4697,9 +4697,15 @@ describe('Chat endpoints', () => {
             for (const gone of ['base-assistant', 'base-tools', 'base-search-plan', 'base-search-results']) {
                 expect((await client.get(`/api/v1/skills/${gone}`, { validateStatus: () => true })).status).toBe(404);
             }
-            for (const gone of ['assistant.md', 'search.md', 'tools.md']) {
+            for (const gone of ['assistant.md', 'search.md', 'tools.md', 'skills', 'components']) {
                 expect(fs.existsSync(new URL(`../../server/instructions/${gone}`, import.meta.url))).toBe(false);
             }
+            // Mollama's own two skills are in the library like every other. The component pages beside the Components
+            // page are opened as components, not as files of a skill, and no page is taken for a skill of its own.
+            expect(SKILLS.filter((skill) => skill.source === 'mollama').map((skill) => [skill.id, skill.files.length])).toEqual([['components', 0], ['skill-map', 6]]);
+            expect(COMPONENT_PAGES.map((page) => page.name)).toEqual(expect.arrayContaining(['Audio', 'Frame', 'Video']));
+            expect(COMPONENT_PAGES.map((page) => page.name)).not.toContain('components');
+            expect(SKILLS.map((skill) => skill.id)).not.toEqual(expect.arrayContaining(['Frame']));
             // A chat with every skill off is sent nothing but the date; with no instructions of its own it has no other system text.
             state.toolsSeen = [];
             const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
@@ -4827,7 +4833,7 @@ describe('Chat endpoints', () => {
             expect(names('demo-anatomy')).toEqual(['Hairline Create']);
 
             // On the real library: Mollama's own figure skills are linked through the guide, and no skill has more than six links.
-            const real = skillLinks(SKILLS.filter((one) => one.source !== 'mollama'), fs.readFileSync(new URL('../../server/instructions/skills/skill-map/examples/combining.md', import.meta.url), 'utf8'));
+            const real = skillLinks(SKILLS.filter((one) => one.source !== 'mollama'), fs.readFileSync(new URL('../../server/instructions/library/skill-map/examples/combining.md', import.meta.url), 'utf8'));
             expect(real.get('anatomy-anatomy')).toEqual(expect.arrayContaining(['hairline-hairline-create']));
             expect([...real.values()].every((list) => list.length <= 6)).toBe(true);
         });
@@ -5375,6 +5381,79 @@ describe('Chat endpoints', () => {
                 setToolCallLimit(null);
                 setFilesFetch(null);
                 await releaseSandboxes();
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
+            }
+        });
+
+        test('the Algorithmic Art build fills the skill\'s viewer template, checks the sketch in a browser when it can, and shows the page', async () => {
+            const sketch = 'let params = { seed: 12345, count: 900, colorPalette: ["#d97757"] };\nfunction setup() { createCanvas(800, 800); initializeSystem(); }\nfunction initializeSystem() { background(250); }\nfunction draw() { for (let i = 0; i < params.count; i++) point(random(width), random(height)); }';
+            const controls = [{ name: 'count', label: 'Grains & dots', type: 'slider', min: 100, max: 2000, step: 100 }, { name: 'colorPalette.0', label: 'First colour', type: 'color' }, { name: 'x" onload="y', label: 'Bad', type: 'slider' }];
+            const template = fs.readFileSync(new URL('../../server/instructions/library/anthropic/anthropic-algorithmic-art/templates/viewer.html', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+            const turn = async (chat, plan) => {
+                state.chatCalls.length = 0;
+                state.toolPlan = plan.map((call) => [call]);
+                const { events } = await send(chat.id, { content: 'make it' });
+                return { told: plan.map((call, at) => state.chatCalls[at + 1].messages.at(-1).content), reply: events.at(-1).reply.content, tools: state.chatCalls[0].tools.map((tool) => tool.function.name) };
+            };
+            const uploads = [];
+            let out = '';
+            try {
+                // Without sandboxes the page is made all the same, and it is said that nobody has opened it.
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anthropic-algorithmic-art'] });
+                const plain = await turn(chat, [['art_build', { title: 'Drift "one"', subtitle: 'Grains < noise', code: sketch, controls }]]);
+                expect(plain.tools).toEqual(expect.arrayContaining(['art_build', 'art_change']));
+                expect(plain.told[0]).toMatch(/^Built "Drift one" from the skill's viewer template and showed it to the user in the chat, with 2 controls\. It was not opened in a browser here\./);
+                expect(plain.reply.match(/<Frame height="640px" title="Drift one" palette="anthropic-dark:text, /g)).toHaveLength(1);
+                expect(plain.reply).toContain('<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.min.js"></script>');
+                expect(plain.reply).toContain('<div class="subtitle">Grains &lt; noise</div>');
+                expect(plain.reply).toContain('<label>Grains &amp; dots</label>');
+                expect(plain.reply).toContain('<input type="color" id="colorPalette.0"');
+                expect(plain.reply).toContain(sketch);
+                // What the template says to always keep is there word for word; its placeholders and web fonts are not.
+                const fixed = template.slice(template.indexOf('function updateSeedDisplay()'), template.indexOf('function resetParameters()')).trim();
+                expect(plain.reply).toContain(fixed);
+                expect(plain.reply).not.toMatch(/fonts\.googleapis|TITLE - EDIT|fill this in|particleCount|onload="y/);
+
+                // A sketch without a needed part, or that cannot be read as JavaScript, is never shown.
+                const wrong = await turn(chat, [['art_build', { title: 'Drift', code: 'function draw() {}', controls: [] }], ['art_build', { title: 'Drift', code: sketch.replace('background(250);', 'background(250;'), controls }]]);
+                expect(wrong.told[0]).toBe('Nothing was built. The sketch has no let params = { seed: 12345, ... }, no function setup(), no function initializeSystem(). Each is needed, written just so.');
+                expect(wrong.told[1]).toMatch(/^Not shown yet\. 1 to fix in the sketch:\nrun: the figure fails when it is opened in a browser: .*\(sketch\.js:3\)\nMend it with art_change/);
+                expect(wrong.reply).not.toContain('<Frame ');
+                expect(wrong.reply).toContain('_The artwork “Drift” is not shown: it did not work when it was opened._');
+
+                process.env.SANDBOX_API_KEY = 'rnd_test';
+                process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+                process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+                setSandboxClient({
+                    create: async () => ({ id: 'sbx-art', status: 'running' }),
+                    exec: async (id, line) => {
+                        const events = line.includes('timeout') ? [{ type: 'output', stream: 'stdout', data: out.shift?.() || '' }, { type: 'exit', exit_code: 0 }] : [{ type: 'exit', exit_code: 0 }];
+                        return (async function* () { yield* events; })();
+                    },
+                    upload: async (id, where, data) => { uploads.push({ where, data: Buffer.from(data).toString() }); },
+                    download: async () => ({ data: Buffer.from('') }),
+                    terminate: async () => {}
+                });
+                // With sandboxes it is opened first: what fails or draws nothing goes back, and is mended by its changes.
+                out = ['PROBE {"errors":[],"colours":1,"canvas":true}\n', 'PROBE {"errors":["grain is not defined"],"colours":9,"canvas":true}\n', 'PROBE {"errors":[],"colours":164,"canvas":true}\n', 'NOP5\n'];
+                const mended = await turn(chat, [['art_build', { title: 'Drift', code: sketch, controls }], ['art_change', { change: [{ find: 'count: 900', replace: 'count: 901' }] }], ['art_change', { change: [{ find: 'count: 901', replace: 'count: 902' }] }]]);
+                expect(mended.told[0]).toContain('run: the figure draws nothing: its canvas is one flat colour after forty frames.');
+                expect(mended.told[1]).toContain('run: the figure fails when it is opened in a browser: grain is not defined');
+                expect(mended.told[2]).toContain('It was opened in a browser, every control and button was used, and it ran without errors.');
+                expect(mended.reply.match(/<Frame /g)).toHaveLength(1);
+                expect(mended.reply).toContain('count: 902');
+                expect(uploads.find((one) => one.where === '/root/job/main.sh').data).toContain('/root/node/node_modules/p5/lib/p5.min.js');
+                expect(uploads.filter((one) => one.where === '/root/work/page.html').at(-1).data).toContain('count: 902');
+
+                // A snapshot that has no p5 yet is not a fault of the sketch.
+                const older = await turn(chat, [['art_change', { title: 'Drift two' }]]);
+                expect(older.told[0]).toMatch(/^Built "Drift two" .* It was not opened in a browser here\./);
+            } finally {
+                state.toolPlan = [];
+                setSandboxClient(null);
+                setToolCallLimit(null);
                 delete process.env.SANDBOX_API_KEY;
                 delete process.env.SANDBOX_WORKSPACE_ID;
                 delete process.env.SANDBOX_SNAPSHOT;
