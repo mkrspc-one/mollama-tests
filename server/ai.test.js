@@ -5367,7 +5367,7 @@ describe('Chat endpoints', () => {
                 const office = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anthropic-docx'] });
                 outs.push({ out: 'made it\n', files: ['report.docx'] }, { out: '=== 0 0\nAll validations PASSED!\n', files: [] });
                 const fine = await turn(office, [['run_program', { language: 'python', code: 'print("made it")' }]]);
-                expect(uploads.filter((one) => one.where === '/root/job/main.sh').at(-1).data).toBe('out=$(python /root/skills/docx/scripts/office/validate.py \'report.docx\' 2>&1); echo "=== 0 $?"; echo "$out" | tail -c 2500');
+                expect(uploads.filter((one) => one.where === '/root/job/main.sh').at(-1).data).toMatch(/docx\.Document\(\)\.save\('\/tmp\/blank\.docx'\).*\nout=\$\(python \/root\/skills\/docx\/scripts\/office\/validate\.py 'report\.docx' --original \/tmp\/blank\.docx 2>&1\); echo "=== 0 \$\?"; echo "\$out" \| tail -c 2500$/);
                 expect(fine.told[0]).toMatch(/^The python program finished with exit code 0\.[\s\S]*\n\nreport\.docx, checked with DOCX's scripts\/office\/validate\.py:\nAll validations PASSED!$/);
                 outs.push({ out: 'made it\n', files: ['report.docx'] }, { out: '=== 0 1\nword/document.xml: an element is out of order\n', files: [] });
                 const faulty = await turn(office, [['run_program', { language: 'python', code: 'print("made it again")' }]]);
