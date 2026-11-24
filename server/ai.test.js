@@ -11,12 +11,12 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, fitPool, freeHardware, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, PYTHON_HOOK, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -2854,7 +2854,7 @@ describe('Chat endpoints', () => {
             expect(back.status).toBe(200);
             state.chatHold = false;
             const events = (await back.text()).split('\n').filter(Boolean).map((line) => JSON.parse(line));
-            expect(events.slice(0, 2).map((event) => event.type)).toEqual(['accepted', 'start']);
+            expect(events.slice(0, 2).map((event) => event.type)).toEqual(['clock', 'accepted']);
             expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('One two three four');
             expect(events[events.length - 1]).toMatchObject({ type: 'done', reply: { content: 'One two three four', stopped: false } });
 
@@ -2989,6 +2989,10 @@ describe('Chat endpoints', () => {
                 for (let attempt = 0; attempt < 200 && !sent.some((piece) => piece.chatId === chat.id && piece.event.type === 'token'); attempt++) await wait(15);
 
                 const joined = (await get(`/chats/${chat.id}/live`)).data;
+                // How long it has been going is the server's to say, so reopening the chat does not start it again.
+                expect(joined.workedMs).toBeGreaterThan(0);
+                await wait(120);
+                expect((await get(`/chats/${chat.id}/live`)).data.workedMs).toBeGreaterThanOrEqual(joined.workedMs + 100);
                 expect(joined.replying).toBe(true);
                 const before = sent.filter((piece) => piece.chatId === chat.id && piece.seq <= joined.seq);
                 expect(joined.seq).toBe(before.length);
@@ -3945,6 +3949,15 @@ describe('Chat endpoints', () => {
             await stream.until((event) => event.type === 'token');
             const busy = (await here()).models[0];
             expect(busy).toMatchObject({ state: 'answering', chat: { id: chat.id, title: 'Harbour notes' }, usedAt: null, idleMs: null, endsAt: null, replies: 1 });
+            // How its context is used: what is sent, part by part, what it has written, and what is left.
+            expect(busy.use).toMatchObject({ now: true, chat: null, total: 32768, room: 8192, steps: 1, putAway: 0 });
+            expect(busy.use.parts.instructions).toBeGreaterThan(1000);
+            expect(busy.use.parts.functions).toBeGreaterThan(500);
+            expect(busy.use.parts).toMatchObject({ pages: 0, results: 0, calls: 0, reply: 0 });
+            expect(busy.use.parts.conversation).toBeLessThan(30);
+            expect(busy.use.parts.writing).toBeGreaterThan(0);
+            expect(busy.use.used).toBe(Object.values(busy.use.parts).reduce((sum, tokens) => sum + tokens, 0));
+            expect(busy.use.left).toBe(32768 - busy.use.used);
 
             // One that is answering is left alone, until its reply is to be stopped as well.
             const id = (await here()).id;
@@ -3959,6 +3972,70 @@ describe('Chat endpoints', () => {
             expect((await stopping).data).toMatchObject({ removed: true });
             expect(state.chatAborted).toBe(before + 1);
             await stream.finished;
+        });
+
+        test('a long skill is opened in parts, word for word, by a model with little room, and whole by one with more', async () => {
+            const anatomy = SKILLS.find((skill) => skill.id === 'anatomy-anatomy');
+            const { start, parts } = skillParts(anatomy.text);
+            // Nothing is lost or changed by taking it apart.
+            expect([start, ...parts.map((part) => part.text)].join('\n').replace(/\s+/g, ' ').trim()).toBe(anatomy.text.replace(/\s+/g, ' ').trim());
+            expect(skillParts('a\n```\n## not a heading\n```\n## One\nx').parts.map((part) => part.title)).toEqual(['One']);
+            expect(skillInParts(anatomy, 16384, '99')).toMatchObject({ failed: 'failed' });
+
+            const usual = state.contextLength;
+            try {
+                state.contextLength = 16384;
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anatomy-anatomy'] });
+                state.toolPlan = [[['open_skill', { skill: 'Anatomy' }]], [['open_skill', { skill: 'Anatomy', part: '3' }]], [['open_skill', { skill: 'Anatomy', part: 'Craft rules' }]]];
+                state.chatCalls.length = 0;
+                const { events } = await send(chat.id, { content: 'draw a pump' });
+                const given = state.chatCalls.at(-1).messages.filter((message) => message.role === 'tool').map((message) => message.content);
+                expect(given[0].startsWith(start)).toBe(true);
+                expect(estimateTokens(given[0])).toBeLessThan(3300);
+                expect(given[0]).toMatch(/This skill is long, so it comes in parts\.[\s\S]*- \d+\. References \(about [\d,]+ tokens\)[\s\S]*part set to its number\./);
+                expect(given[1]).toBe(`Anatomy, part 3 of ${parts.length}\n\n${parts[2].text}`);
+                expect(given[2]).toContain(parts.find((part) => part.title.startsWith('Craft rules')).text);
+                expect(events.at(-1).reply.steps.map((step) => step.input)).toEqual(['Anatomy', 'Anatomy, part 3', 'Anatomy, part Craft rules']);
+                // It is not sent whole from then on either: it stays on the list.
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'and a valve' });
+                expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain(parts[5].text.slice(0, 80).replace(/"/g, ''));
+                expect(state.chatCalls[0].tools.find((tool) => tool.function.name === 'open_skill').function.parameters.properties.skill.enum).toContain('Anatomy');
+
+                state.contextLength = 131072;
+                const roomy = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anatomy-anatomy'], options: { num_ctx: 131072 } });
+                state.toolPlan = [[['open_skill', { skill: 'Anatomy' }]]];
+                state.chatCalls.length = 0;
+                await send(roomy.id, { content: 'draw a pump' });
+                expect(state.chatCalls.at(-1).messages.find((message) => message.role === 'tool').content.startsWith(anatomy.text)).toBe(true);
+            } finally {
+                state.contextLength = usual;
+            }
+        });
+
+        test('an idle model says how its last reply used its context, with what its tools gave back, until the chat is deleted', async () => {
+            state.running = [{ name: 'qwen2.5-coder:7b', size: 100, size_vram: 100 }];
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', title: 'Sums' });
+            state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
+            const { events } = await send(chat.id, { content: 'what is 6 * 7' });
+            const told = events.filter((event) => event.type === 'context').map((event) => event.context);
+            expect(told.length).toBeGreaterThanOrEqual(2);
+            expect(told.at(-1)).toMatchObject({ steps: 2 });
+            const { use } = (await here()).models[0];
+            expect(use).toMatchObject({ now: false, chat: { id: chat.id, title: 'Sums' }, steps: 2 });
+            expect(use.parts.results).toBeGreaterThan(0);
+            expect(use.parts.calls).toBeGreaterThan(0);
+            await client.delete(`/api/v1/chats/${chat.id}`);
+            expect((await here()).models[0].use).toBeNull();
+        });
+
+        test('what a model wrote while it worked does not count against the chat once the reply is there', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'hello' });
+            await Chat.updateOne({ _id: chat.id }, { $set: { 'messages.1.stats.evalCount': 60608, 'messages.1.stats.promptEvalCount': 5648 } });
+            const { context } = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(context.usedTokens).toBeLessThan(7000);
+            expect(context.percent).toBeLessThan(40);
         });
 
         test('a model still loading for a reply is shown as loading', async () => {
@@ -5071,7 +5148,7 @@ describe('Chat endpoints', () => {
                 // program go in, the program runs, what it made comes back and is saved beside the file, and the sandbox goes.
                 const told = await turn(work, 'once');
                 expect(made).toEqual([expect.objectContaining({ snapshotName: 'mollama-skills', networkPolicy: { type: 'deny-all' } })]);
-                expect(sent.map((one) => one.where)).toEqual(['/root/work/report.pdf', '/root/job/main.py']);
+                expect(sent.map((one) => one.where)).toEqual(['/root/work/report.pdf', '/root/job/main.py', '/root/job/hook/sitecustomize.py']);
                 expect(sent[0].data).toBe(fsFiles['/docs/report.pdf'].bytes.toString());
                 expect(sent[1].data).toBe('print("made it")');
                 expect(lines.find((line) => line.includes('timeout'))).toMatch(/^cd \/root\/work && export .*timeout -k 5 300 python \/root\/job\/main\.py$/);
@@ -5120,7 +5197,7 @@ describe('Chat endpoints', () => {
                 state.chatCalls = [];
                 const { events: looked } = await send(chat.id, { content: 'look around' });
                 expect(looked.some((event) => event.type === 'permission')).toBe(false);
-                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^The bash program finished with exit code 0\.[\s\S]*nothing was saved: call again with save_to/);
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^The bash program finished with exit code 0\.[\s\S]*nothing was saved\. To save any of it, call change_program with save listing the files and save_to/);
                 expect(uploads).toHaveLength(before);
 
                 // Pictures named in look come back to a model that can see, as images on the result, and are not saved;
@@ -5169,6 +5246,8 @@ describe('Chat endpoints', () => {
         describe('A program too long for the room left', () => {
             const ran = [];
             let exits = [];
+            let errors = null;
+            const inSandbox = {};
             const withSandbox = async (work) => {
                 process.env.SANDBOX_API_KEY = 'rnd_test';
                 process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
@@ -5176,17 +5255,21 @@ describe('Chat endpoints', () => {
                 ran.length = 0;
                 exits = [];
                 let code = '';
+                errors = null;
                 setSandboxClient({
                     create: async () => ({ id: 'sbx-1', status: 'running' }),
                     exec: async (id, line) => {
                         const runs = line.includes('timeout');
                         if (runs) ran.push(code);
                         const exit = runs ? exits.shift() ?? 0 : 0;
-                        const events = [...(exit ? [{ type: 'output', stream: 'stderr', data: 'SyntaxError: invalid syntax\n' }] : []), { type: 'exit', exit_code: exit }];
+                        const events = [...(exit ? [{ type: 'output', stream: 'stderr', data: errors || 'SyntaxError: invalid syntax\n' }] : []), { type: 'exit', exit_code: exit }];
                         return (async function* () { yield* events; })();
                     },
-                    upload: async (id, where, data) => { code = Buffer.from(data).toString(); },
-                    download: async () => ({ data: Buffer.from('') }),
+                    upload: async (id, where, data) => { if (where.startsWith('/root/job/main')) code = Buffer.from(data).toString(); },
+                    download: async (id, where) => {
+                        if (!inSandbox[where]) throw new Error('not found');
+                        return { data: Buffer.from(inSandbox[where]) };
+                    },
                     terminate: async () => {}
                 });
                 try {
@@ -5254,6 +5337,72 @@ describe('Chat endpoints', () => {
                     const other = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] });
                     expect((await turn(other, [[['change_program', { add: 'x' }]]])).asked[1]).toMatch(/^There is no program in this chat to change/);
                 });
+            });
+
+            test('a failed program names the skill page on its library that was not read, and keeps the end of a long error', async () => {
+                await withSandbox(async () => {
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['cadsmith-make-model'] });
+                    errors = `Traceback\n  File "/root/env/lib/python3.11/site-packages/build123d/build_common.py", line 1\n${'x'.repeat(6000)}\nTypeError: Hole.__init__() got an unexpected keyword argument 'center'\n`;
+                    exits = [1, 1, 137];
+                    const wrong = { language: 'python', code: 'from build123d import *\nHole(center=1)\n' };
+                    const before = await turn(chat, [[['run_program', wrong]]]);
+                    const told = before.asked[1];
+                    const first = await turn(chat, [
+                        [['open_skill_file', { skill: 'cadsmith-make-model', file: 'references/build123d-guide.md' }]],
+                        [['change_program', { change: [{ find: 'center=1', replace: 'center=2' }] }]],
+                        [['change_program', { change: [{ find: 'center=2', replace: 'radius=2' }] }]]
+                    ]);
+                    expect(told).toMatch(/Traceback[\s\S]*\[\.\.\. [\d,]+ characters left out \.\.\.\][\s\S]*unexpected keyword argument 'center'/);
+                    expect(told).toMatch(/The skill CadSmith Make Model has a page on build123d that you have not read in this reply: call open_skill_file with skill "cadsmith-make-model" and file "references\/build123d-guide\.md" before trying again\.$/);
+                    // Once it is read, it is not named again.
+                    expect(first.asked[2]).toMatch(/The program is kept\. To mend it, send only what changes with change_program\.$/);
+                    // Ended by the computer long before its time was up is memory, not time.
+                    expect(first.asked[3]).toMatch(/was ended by the computer it ran on after \d+ seconds, most likely for using too much memory/);
+                    // What was sent is on each step, for the person to open.
+                    expect([...before.steps, ...first.steps].map((step) => step.sent || null)).toEqual([wrong.code, null, 'Replace:\ncenter=1\n\nWith:\ncenter=2', 'Replace:\ncenter=2\n\nWith:\nradius=2']);
+                    const saved = (await get(`/chats/${chat.id}`)).data.chat.messages[1];
+                    expect(saved.steps[0].sent).toBe(wrong.code);
+                });
+            });
+
+            test('files an earlier run made are saved without running anything', async () => {
+                const uploads = [];
+                setFilesFetch(async (url, options) => {
+                    if (!String(url).endsWith('/files/upload')) return fakeFilesystemOne(url, options);
+                    uploads.push({ folder: options.body.get('basePath'), paths: options.body.get('relativePaths') });
+                    return new Response(JSON.stringify({ success: true }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+                });
+                try {
+                    await withSandbox(async (chat) => {
+                        inSandbox['/root/work/out/a.stl'] = 'solid';
+                        const ask = async (input) => {
+                            state.toolPlan = [[['change_program', input]]];
+                            state.chatCalls.length = 0;
+                            const pending = send(chat.id, { content: 'save it' });
+                            for (let tries = 0; tries < 200 && !waitingPermissions().some((one) => one.chatId === chat.id); tries += 1) await wait(25);
+                            const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
+                            await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer: 'once' });
+                            await pending;
+                            return state.chatCalls[1].messages.at(-1).content;
+                        };
+                        const gone = { save: ['out/a.stl'], save_to: '/casts' };
+                        expect(await ask(gone)).toMatch(/^Nothing was saved: the computer those files were on is gone/);
+                        await turn(chat, [[['run_program', { language: 'bash', code: 'make' }]]]);
+                        expect(await ask({ save: ['out/a.stl', 'out/none.stl'], save_to: '/casts' })).toMatch(/^Saved in \/.*casts: out\/a\.stl\..*Not there: out\/none\.stl\.$/);
+                        expect(uploads).toHaveLength(1);
+                        expect(uploads[0].paths).toBe('["out/a.stl"]');
+                        expect(ran).toEqual(['make']);
+                        // Without a folder nothing of the person's is touched, and nothing is saved.
+                        expect((await turn(chat, [[['change_program', { save: ['out/a.stl'] }]]])).asked[1]).toMatch(/^Nothing was saved\. Say which folder/);
+                    });
+                } finally {
+                    setFilesFetch(fakeFilesystemOne);
+                }
+            });
+
+            test('the Python a program runs under is told where a stopped program was and what a wrong call accepts', () => {
+                expect(PYTHON_HOOK).toContain('faulthandler.register(signal.SIGTERM');
+                expect(PYTHON_HOOK).toContain('What it accepts: ');
             });
 
             test('the same failing call is not run a third time, and other work is not held back', async () => {
@@ -6818,7 +6967,7 @@ describe('Linked devices', () => {
     });
 
     // Stands in for a desktop app whose computer can chat and download, and whose connection can be cut part-way.
-    const workingApp = (deviceId, key, { cutPull = false, cutChat = false } = {}) => new Promise((resolve) => {
+    const workingApp = (deviceId, key, { cutPull = false, cutChat = false, hello = {}, holdChat = null } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
         const app = { ws, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)) };
         open.push(ws);
@@ -6830,11 +6979,15 @@ describe('Linked devices', () => {
             piece(id, JSON.stringify(body));
             say({ id, type: 'end' });
         };
-        ws.addEventListener('open', () => say({ type: 'hello', deviceId, key }));
+        ws.addEventListener('open', () => say({ type: 'hello', deviceId, key, ...hello }));
         ws.addEventListener('close', () => resolve(app));
         ws.addEventListener('message', (event) => {
             const message = JSON.parse(event.data);
-            if (message.type === 'welcome') return resolve(app);
+            if (message.type === 'cancel') (app.cancelled ||= []).push(message.id);
+            if (message.type === 'welcome') {
+                app.welcome = message;
+                return resolve(app);
+            }
             if (message.type === 'ask') return say({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 900000, diskTotalMb: 1000000 } : { ...hardware, memoryMb: 32768 } });
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
@@ -6851,6 +7004,7 @@ describe('Linked devices', () => {
                 piece(message.id, { status: 'success' });
                 return say({ id: message.id, type: 'end' });
             }
+            if (message.path === '/api/chat' && holdChat) return holdChat(message, app);
             if (message.path === '/api/chat') {
                 head(message.id, 200, 'application/x-ndjson');
                 piece(message.id, { model: 'tiny:1b', message: { role: 'assistant', content: 'Half an ' }, done: false });
@@ -6929,6 +7083,86 @@ describe('Linked devices', () => {
         const after = (await client.get(`/api/v1/chats/${chat.id}`)).data.chat;
         expect(after.messages[after.messages.length - 1]).toMatchObject({ role: 'assistant', content: 'Half an answer.' });
         expect(after.messages[after.messages.length - 1].error).toBeNull();
+    });
+
+    test('a reply goes on when its computer comes back: only the step being written is asked again', async () => {
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('drops-and-returns');
+        const app = await workingApp(id, key, { cutChat: true });
+        const chat = (await client.post('/api/v1/chats', { device: id, model: 'tiny:1b' })).data.chat;
+        const pending = client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'say something long' }, { responseType: 'text', transformResponse: [(data) => data] });
+        await app.closed;
+        const back = await workingApp(id, key);
+        const pieces = String((await pending).data).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        expect(pieces.some((piece) => piece.type === 'note' && /^The link to your computer dropped/.test(piece.text))).toBe(true);
+        expect(pieces.at(-1)).toMatchObject({ type: 'done', reply: { content: 'Half an answer.', error: null } });
+        expect(back.requests.filter((one) => one === 'POST /api/chat')).toHaveLength(1);
+    });
+
+    test('an app that keeps the model writing while its link is down hands over the rest, and nothing is asked again or taken twice', async () => {
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('keeps-writing');
+        const line = (value) => Buffer.from(`${JSON.stringify(value)}\n`).toString('base64');
+        const part = (content) => line({ model: 'tiny:1b', message: { role: 'assistant', content }, done: false });
+        let asked = null;
+        let pieces = [];
+        const holdChat = (message, app) => {
+            asked = message.id;
+            pieces = [{ type: 'head', status: 200, headers: { 'content-type': 'application/x-ndjson' } }, { type: 'chunk', data: part('One ') }, { type: 'chunk', data: part('two ') }]
+                .map((one, at) => ({ id: asked, n: at + 1, ...one }));
+            for (const one of pieces) app.ws.send(JSON.stringify(one));
+            setTimeout(() => app.ws.close(), 80);
+        };
+        const first = await workingApp(id, key, { hello: { resume: true }, holdChat });
+        expect(first.welcome.session).toEqual(expect.any(String));
+        const chat = (await client.post('/api/v1/chats', { device: id, model: 'tiny:1b' })).data.chat;
+        const pending = client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'count' }, { responseType: 'text', transformResponse: [(data) => data] });
+        await first.closed;
+        // Meanwhile the model went on writing; on return the server says what it has, and is sent the last piece it had too.
+        const back = await workingApp(id, key, { hello: { resume: true, session: first.welcome.session, held: [asked, '999999'] } });
+        expect(back.welcome.have).toEqual({ [asked]: 3 });
+        const rest = [pieces[2], { id: asked, n: 4, type: 'chunk', data: part('three.') }, { id: asked, n: 5, type: 'chunk', data: line({ model: 'tiny:1b', message: { role: 'assistant', content: '' }, done: true, eval_count: 3, eval_duration: 1000000 }) }, { id: asked, n: 6, type: 'end' }];
+        for (const one of rest) back.ws.send(JSON.stringify(one));
+        const events = String((await pending).data).split('\n').filter(Boolean).map((one) => JSON.parse(one));
+        expect(events.at(-1)).toMatchObject({ type: 'done', reply: { content: 'One two three.' } });
+        expect(events.some((event) => event.type === 'replace' || /link to your computer/.test(event.text || ''))).toBe(false);
+        expect(back.requests.some((one) => one === 'POST /api/chat')).toBe(false);
+
+        // An app that lost what it was asked (it was restarted) makes the step be asked again.
+        const third = await workingApp(id, key, { hello: { resume: true, session: first.welcome.session, held: [] }, holdChat });
+        const again = client.post(`/api/v1/chats/${chat.id}/messages`, { regenerate: true }, { responseType: 'text', transformResponse: [(data) => data] });
+        await third.closed;
+        const fresh = await workingApp(id, key, { hello: { resume: true } });
+        expect(String((await again).data)).toMatch(/Half an answer\./);
+        expect(fresh.welcome.have).toEqual({});
+
+        // Stopped while the link is down: the app is told nothing is wanted of it any more.
+        const fourth = await workingApp(id, key, { hello: { resume: true }, holdChat });
+        const stopped = client.post(`/api/v1/chats/${chat.id}/messages`, { regenerate: true }, { responseType: 'text', transformResponse: [(data) => data] });
+        await fourth.closed;
+        await client.post(`/api/v1/chats/${chat.id}/stop`);
+        await stopped;
+        const last = await workingApp(id, key, { hello: { resume: true, session: fourth.welcome.session, held: [asked] } });
+        expect(last.welcome.have).toEqual({});
+    });
+
+    test('why a link closed is said, with how long it lasted, and a computer may miss two checks', async () => {
+        const gateway = new DeviceGateway();
+        gateway.pingMs = 30;
+        const ends = [];
+        gateway.on('closed', (deviceId, about) => ends.push({ deviceId, ...about }));
+        const sent = [];
+        const handlers = {};
+        const ws = { on: (event, fn) => { handlers[event] = fn; }, send: (text) => sent.push(JSON.parse(text)), close: () => {}, ping: () => {}, terminate: () => handlers.close(1006, '') };
+        gateway.attach('quiet', ws, { resume: true });
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        expect(ends).toEqual([]);
+        handlers.pong();
+        await new Promise((resolve) => setTimeout(resolve, 45));
+        expect(ends).toEqual([]);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(ends).toEqual([{ deviceId: 'quiet', code: 1006, reason: '', missed: 3, seconds: 0, replaced: false, held: 0 }]);
+        expect(sent.filter((one) => one.type === 'beat').length).toBeGreaterThanOrEqual(3);
     });
 
     test('removing a computer disconnects it and cancels its key', async () => {
@@ -7695,6 +7929,10 @@ describe('Online model providers', () => {
         };
         asked.length = 0;
         const events = await say('Work it out: 6 * 7');
+        // The memory list names the online model with how it used its context, and claims no memory for it.
+        const service = (await client.get('/api/v1/devices/memory')).data.online.find((one) => one.id === provider.id);
+        expect(service.models).toEqual([expect.objectContaining({ name: 'claude-large', displayName: 'Claude Large', source: 'online', state: 'idle', sizeMb: null, context: 1000000 })]);
+        expect(service.models[0].use).toMatchObject({ now: false, total: 1000000, steps: 2 });
         // Every tool is sent with eager input streaming, and the call's input reaches the page piece by piece.
         const first = asked.find((one) => one.path === '/v1/messages');
         expect(first.body.tools.length).toBeGreaterThan(0);
