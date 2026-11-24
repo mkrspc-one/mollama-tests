@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -3974,6 +3974,32 @@ describe('Chat endpoints', () => {
             await stream.finished;
         });
 
+        test('the page a skill says to read before building comes with the skill when it fits, and is named when it does not', async () => {
+            const usual = state.contextLength;
+            const opened = async (length, id, name) => {
+                state.contextLength = length;
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: [id] });
+                state.toolPlan = [[['open_skill', { skill: name }]]];
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'build it' });
+                return state.chatCalls.at(-1).messages.find((message) => message.role === 'tool').content;
+            };
+            try {
+                const hairline = SKILLS.find((skill) => skill.id === 'hairline-hairline-create');
+                const text = await opened(32768, hairline.id, hairline.name);
+                // The skill's own page comes first, word for word.
+                expect(text.startsWith(hairline.text)).toBe(true);
+                expect(text).toContain('READ BEFORE YOU BUILD\nkernel.js:\n\n/* hairline kernel sha256:');
+                expect(text).toContain('Cam(azDeg, k, S)');
+                expect(text.slice(hairline.text.length)).not.toContain('var HL');
+                const cad = SKILLS.find((skill) => skill.id === 'cadsmith-make-model');
+                expect(await opened(32768, cad.id, cad.name)).toContain('with Locations((0, 0)):\n        Hole(radius=3)');
+                expect(await opened(8192, cad.id, cad.name)).toMatch(/READ BEFORE YOU BUILD\nreferences\/build123d-guide\.md \(about [\d,]+ tokens\): read it with open_skill_file before you build\./);
+            } finally {
+                state.contextLength = usual;
+            }
+        });
+
         test('a long skill is opened in parts, word for word, by a model with little room, and whole by one with more', async () => {
             const anatomy = SKILLS.find((skill) => skill.id === 'anatomy-anatomy');
             const { start, parts } = skillParts(anatomy.text);
@@ -4941,12 +4967,15 @@ describe('Chat endpoints', () => {
 
             // The first build of a faulty figure shows nothing and says what to fix, in the validator's own words.
             state.chatCalls.length = 0;
-            state.toolPlan = [[['hairline_build', { code: wrong }]], [['hairline_build', { code: riffle }]]];
+            state.toolPlan = [[['hairline_build', { code: wrong }]], [['hairline_change', { change: [{ find: 'setTimeout(() => {}, 10);', replace: '' }, { find: 'const tint = "#ff0000";', replace: '' }] }]]];
             const mended = await send(chat.id, { content: 'draw it again' });
             const told = state.chatCalls[1].messages.at(-1).content;
-            expect(told).toMatch(/^Not shown yet\. validate found 2 to fix in hairline-riffle\.html:\npaint: rule 04\. /);
+            expect(told).toMatch(/^Not shown yet\. 2 to fix in hairline-riffle\.html:\npaint: rule 04\. /);
             expect(told).toContain('\nclock: rule 07. The figure runs a clock of its own.');
-            expect(told.endsWith('Fix these in the figure and call hairline_build again with the whole file.')).toBe(true);
+            // It is told to send only what changes, and, not having read it, what a figure may call.
+            expect(told).toContain('Mend these with hairline_change, sending only the lines that change.\n\nWhat a figure may call, from kernel.js (nothing else exists):\n/* hairline kernel sha256:');
+            expect(told).toContain('Cam(azDeg, k, S)');
+            expect(told).not.toContain('var HL');
             expect(state.chatCalls[2].messages.at(-1).content).toMatch(/validate: ok/);
             expect(mended.events.at(-1).reply.content.match(/<Frame /g)).toHaveLength(1);
 
@@ -4993,7 +5022,7 @@ describe('Chat endpoints', () => {
             expect(head.length).toBeLessThan(onDisk('kernel.js').length / 2);
 
             // The figure is put on the skill's own page and shown in the reply; a file that is not a figure builds nothing.
-            expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'tool', content: 'Built hairline-terrain.html and showed it to the user in the chat. validate: ok, the figure passes the static checks. You cannot see the page from here, so the look has not been done.' });
+            expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'tool', content: 'Built hairline-terrain.html and showed it to the user in the chat. validate: ok, the figure passes the static checks. It was not opened in a browser here. You cannot see the page from here, so the look has not been done.' });
             expect(state.chatCalls[3].messages.at(-1).content).toMatch(/^Nothing was built\. A figure file ends with hairline\(/);
             const reply = list.at(-1).reply;
             expect(reply.content).toContain(['```component', '<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline terrain" palette="ground:background, ink:text, muted:text 65%, line:border, hairline-plate:background, hairline-hi:text, hairline-edge:text 55%, hairline-mid:text 32%, hairline-lo:border">', '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', terrain, '</Part>', '</Frame>', '```'].join('\n'));
@@ -5024,6 +5053,7 @@ describe('Chat endpoints', () => {
             const wrong = riffle.replace(/\bhairline\s*\(\s*\{(?![\s\S]*\bhairline\s*\(\s*\{)/, (found) => `setTimeout(() => {}, 10);\n${found}`);
             const uploads = [];
             const ended = [];
+            let probe = null;
             let mode = 'faulty';
             let finishSlow = () => {};
             process.env.SANDBOX_API_KEY = 'rnd_test';
@@ -5039,7 +5069,7 @@ describe('Chat endpoints', () => {
                     if (line.includes('timeout')) {
                         if (mode === 'slow') await new Promise((resolve) => { finishSlow = resolve; });
                         events = mode === 'clean'
-                            ? [{ type: 'output', stream: 'stdout', data: 'ok page.html: kernel and bench intact, and the figure passes the static checks.\n' }, { type: 'exit', exit_code: 0 }]
+                            ? [{ type: 'output', stream: 'stdout', data: `ok page.html: kernel and bench intact, and the figure passes the static checks.\nPROBE ${probe ? JSON.stringify(probe) : 'none'}\n` }, { type: 'exit', exit_code: 0 }]
                             : [{ type: 'output', stream: 'stderr', data: 'spin: said by the kit in the sandbox only.\n1 to fix in page.html\n' }, { type: 'exit', exit_code: 1 }];
                     }
                     return (async function* () { yield* events; })();
@@ -5066,17 +5096,33 @@ describe('Chat endpoints', () => {
                 expect(job).toContain('node /root/skills/hairline-create/build.mjs figure.js page.html');
                 expect(job).toContain('node /root/skills/hairline-create/validate.mjs page.html');
                 expect(ended).toEqual(['sbx-hairline']);
-                expect(told).toBe('Not shown yet. validate found 1 to fix in hairline-riffle.html:\nspin: said by the kit in the sandbox only.\nFix these in the figure and call hairline_build again with the whole file.');
+                expect(told).toMatch(/^Not shown yet\. 1 to fix in hairline-riffle\.html:\nspin: said by the kit in the sandbox only\.\nMend these with hairline_change, sending only the lines that change\.\n\nWhat a figure may call/);
 
                 // A page validate passes is shown.
                 mode = 'clean';
-                expect(await build(riffle)).toMatch(/^Built hairline-riffle\.html and showed it to the user in the chat\. validate: ok/);
+                expect(await build(riffle)).toMatch(/^Built hairline-riffle\.html and showed it to the user in the chat\. validate: ok, the figure passes the static checks\. It was not opened in a browser here\./);
+
+                // It is opened in the sandbox's browser too. One that runs is said to; one that fails or draws nothing is
+                // never shown, however often it is sent, and the person is told why in its place.
+                expect(job).toContain('chromium --headless');
+                expect(uploads.find((one) => one.where === '/root/work/probe.js').data).toContain('figure-probe');
+                probe = { errors: [], drawn: 40, bad: false };
+                expect(await build(riffle)).toMatch(/It was opened in a browser, the pointer and the slider were moved, and it ran without errors\./);
+                probe = { errors: ['Uncaught TypeError: topY.set is not a function'], drawn: 0, bad: false };
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+                state.chatCalls.length = 0;
+                state.toolPlan = [1, 2, 3].map(() => [['hairline_build', { code: `${riffle}\n// ${state.toolPlan.length}${Math.random()}` }]]);
+                const { events } = await send(chat.id, { content: 'draw it' });
+                expect(state.chatCalls[3].messages.at(-1).content).toMatch(/^Not shown yet\. 1 to fix in hairline-riffle\.html:\nrun: the figure fails when it is opened in a browser: Uncaught TypeError: topY\.set is not a function/);
+                expect(events.at(-1).reply.content).not.toContain('<Frame ');
+                expect(events.at(-1).reply.content).toContain('_The figure “riffle” is not shown: it did not work when it was opened._');
+                probe = null;
 
                 // A sandbox that cannot start, or is slow, is not waited on: the checks kept here speak instead.
                 for (const which of ['down', 'slow']) {
                     mode = which;
                     const local = await build(wrong);
-                    expect(local).toMatch(/^Not shown yet\. validate found 1 to fix/);
+                    expect(local).toMatch(/^Not shown yet\. 1 to fix/);
                     expect(local).toMatch(/clock: rule 07/);
                     expect(local).not.toMatch(/said by the kit in the sandbox only/);
                 }
@@ -5318,7 +5364,7 @@ describe('Chat endpoints', () => {
                     ]);
                     expect(ran).toEqual(['x = 1\nprint(x\n', 'x = 1\nprint(x)\n']);
                     expect(first.asked[1]).toMatch(/SyntaxError: invalid syntax[\s\S]*The program is kept\. To mend it, send only what changes with change_program\.$/);
-                    expect(first.asked[2]).toMatch(/^Nothing was changed or run\. The find text of change 1 is not in the program\./);
+                    expect(first.asked[2]).toMatch(/^Nothing was changed or run\. The find text of change 1 is not in it\./);
                     expect(first.asked[3]).toBe('Lines 2 to 2 of 2:\nprint(x');
 
                     // It is still there for the next message, and a text that occurs twice is not guessed at.
@@ -5378,17 +5424,17 @@ describe('Chat endpoints', () => {
                         const ask = async (input) => {
                             state.toolPlan = [[['change_program', input]]];
                             state.chatCalls.length = 0;
-                            const pending = send(chat.id, { content: 'save it' });
-                            for (let tries = 0; tries < 200 && !waitingPermissions().some((one) => one.chatId === chat.id); tries += 1) await wait(25);
-                            const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
-                            await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer: 'once' });
-                            await pending;
+                            const { events } = await send(chat.id, { content: 'save it' });
+                            expect(events.some((event) => event.type === 'permission')).toBe(false);
                             return state.chatCalls[1].messages.at(-1).content;
                         };
                         const gone = { save: ['out/a.stl'], save_to: '/casts' };
                         expect(await ask(gone)).toMatch(/^Nothing was saved: the computer those files were on is gone/);
                         await turn(chat, [[['run_program', { language: 'bash', code: 'make' }]]]);
-                        expect(await ask({ save: ['out/a.stl', 'out/none.stl'], save_to: '/casts' })).toMatch(/^Saved in \/.*casts: out\/a\.stl\..*Not there: out\/none\.stl\.$/);
+                        expect(await ask({ save: ['out/a.stl', 'out/none.stl'], save_to: '/casts' })).toMatch(/^It made out\/a\.stl\. The user is being asked whether to save them in \/.*casts; you need not wait\. Go on, and do not say they are saved\. Not there: out\/none\.stl\.$/);
+                        expect(uploads).toHaveLength(0);
+                        const offered = (await get(`/chats/${chat.id}`)).data.chat.messages.at(-1).steps[0].save;
+                        expect((await post(`/chats/${chat.id}/saves/${offered.id}`, { answer: 'save' })).status).toBe(200);
                         expect(uploads).toHaveLength(1);
                         expect(uploads[0].paths).toBe('["out/a.stl"]');
                         expect(ran).toEqual(['make']);
@@ -5403,6 +5449,24 @@ describe('Chat endpoints', () => {
             test('the Python a program runs under is told where a stopped program was and what a wrong call accepts', () => {
                 expect(PYTHON_HOOK).toContain('faulthandler.register(signal.SIGTERM');
                 expect(PYTHON_HOOK).toContain('What it accepts: ');
+            });
+
+            test('a program nobody answered for is not run, says why, and the model is told how to go on without asking', async () => {
+                setPermissionWait(60);
+                try {
+                    await withSandbox(async (chat) => {
+                        const { asked, steps, events } = await turn(chat, [
+                            [['run_program', { language: 'bash', code: 'make', files: ['/docs/report.pdf'], save_to: '/casts' }]],
+                            [['run_program', { language: 'bash', code: 'make' }]]
+                        ]);
+                        expect(asked[1]).toMatch(/^Mollama did not run the program: it asked whether the program may read \/docs\/report\.pdf and save files in \/.*casts, and there was no answer within 1 minute\.\n\nNobody was there to answer\. Run it again without files, which needs no permission/);
+                        expect(steps.map((step) => step.failed)).toEqual(['unanswered', null]);
+                        expect(events.find((event) => event.type === 'permission').asks).toMatch(/^read \/docs\/report\.pdf and save files in /);
+                        expect(ran).toEqual(['make']);
+                    });
+                } finally {
+                    setPermissionWait(null);
+                }
             });
 
             test('the same failing call is not run a third time, and other work is not held back', async () => {
@@ -5938,33 +6002,63 @@ describe('Chat endpoints', () => {
                 expect((await post('/files/save-address', { folder: '/docs', name: 'duck.png', url: 'http://models.example/duck.png' })).status).toBe(400);
                 expect((await post('/files/save-address', { folder: '/docs', name: '../duck.png', url: 'https://models.example/duck.png' })).status).toBe(400);
 
-                // From a model: it asks first, then saves what it found.
+                // From a model: the file is made ready and offered to the person, and the reply is not held up.
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 state.toolPlan = [[['save_to_files', { folder: '/docs', name: 'found.png', address: 'https://models.example/found.png' }]]];
                 state.chatCalls = [];
-                const pending = send(chat.id, { content: 'save that picture' });
-                for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
-                const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
-                expect(waiting).toBeTruthy();
-                expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer: 'once' })).status).toBe(200);
-                const { events } = await pending;
+                const before2 = uploads.length;
+                const { events } = await send(chat.id, { content: 'save that picture' });
+                expect(events.some((event) => event.type === 'permission')).toBe(false);
+                expect(uploads).toHaveLength(before2);
+                const saveOf = async (id) => (await get(`/chats/${id}`)).data.chat.messages.at(-1).steps[0].save;
+                const offer = await saveOf(chat.id);
+                expect(offer).toMatchObject({ names: ['found.png'], state: 'waiting' });
+                expect((await post(`/chats/${chat.id}/saves/${offer.id}`, { answer: 'maybe' })).status).toBe(400);
+                expect((await post(`/chats/${chat.id}/saves/${'a'.repeat(16)}`, { answer: 'save' })).status).toBe(404);
+                expect((await post(`/chats/${chat.id}/saves/${offer.id}`, { answer: 'save' })).data).toMatchObject({ state: 'saved' });
+                expect(await saveOf(chat.id)).toMatchObject({ state: 'saved' });
+                // Answered once.
+                expect((await post(`/chats/${chat.id}/saves/${offer.id}`, { answer: 'save' })).status).toBe(404);
                 // A folder a model names goes inside the person's own folder, where they can see it, and the model is
                 // told the full path.
                 const home = uploads.at(-1).folder.replace(/\/docs$/, '');
                 expect(home).toMatch(/^\/[a-z0-9]+$/);
                 expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Save to files', input: `${home}/docs/found.png` });
                 expect(uploads.at(-1)).toMatchObject({ folder: `${home}/docs`, paths: '["found.png"]' });
-                expect(state.chatCalls[1].messages.at(-1).content).toContain(`to ${home}/docs/found.png.`);
+                expect(state.chatCalls[1].messages.at(-1).content).toBe(`${home}/docs/found.png is ready. The user is being asked whether to save it; you need not wait. Go on, and do not say it is saved.`);
 
                 // A folder already in their home, or one climbing out of it, stays inside it.
                 for (const [folder, where] of [[`${home}/Gearbox/`, `${home}/Gearbox`], ['/../Gearbox', `${home}/Gearbox`], ['/', home]]) {
                     state.toolPlan = [[['save_to_files', { folder, name: 'found.png', address: 'https://models.example/found.png' }]]];
-                    const again = send(chat.id, { content: 'save it again' });
-                    for (let tries = 0; tries < 200 && !waitingPermissions().some((one) => one.chatId === chat.id); tries += 1) await wait(25);
-                    await post(`/chats/${chat.id}/permission`, { id: waitingPermissions().find((one) => one.chatId === chat.id).id, answer: 'once' });
-                    await again;
+                    await send(chat.id, { content: 'save it again' });
+                    const next = await saveOf(chat.id);
+                    expect(next.folder).toBe(where);
+                    await post(`/chats/${chat.id}/saves/${next.id}`, { answer: 'save' });
                     expect(uploads.at(-1).folder).toBe(where);
                 }
+                // Not saved, and never offered again; always, and the next one is saved at once.
+                const turnOf = async (answer) => {
+                    state.toolPlan = [[['save_to_files', { folder: '/docs', name: 'found.png', address: 'https://models.example/found.png' }]]];
+                    await send(chat.id, { content: 'save it again' });
+                    const next = await saveOf(chat.id);
+                    if (next && answer) await post(`/chats/${chat.id}/saves/${next.id}`, { answer });
+                    return next;
+                };
+                const count = uploads.length;
+                await turnOf('no');
+                expect(uploads).toHaveLength(count);
+                expect(await saveOf(chat.id)).toMatchObject({ state: 'dropped' });
+                await turnOf('always');
+                expect(await turnOf(null)).toBeUndefined();
+                expect(uploads).toHaveLength(count + 2);
+                // Another person cannot answer for this one.
+                const other = await newChat({ model: 'qwen2.5-coder:7b' });
+                state.toolPlan = [[['save_to_files', { folder: '/docs', name: 'found.png', content: 'x' }]]];
+                await send(other.id, { content: 'save it' });
+                const theirs = await saveOf(other.id);
+                await testStartup.loginAsUser('creator');
+                expect((await post(`/chats/${other.id}/saves/${theirs.id}`, { answer: 'save' })).status).toBe(404);
+                await testStartup.loginAsUser('user');
             } finally {
                 setRemoteTransport(before);
                 setFilesFetch(fakeFilesystemOne);
@@ -8192,8 +8286,8 @@ describe('Tools in chats', () => {
         called.length = 0;
         const refused = await turn('no');
         expect(called).toEqual([]);
-        expect(toolTurns(state.chatCalls[1])[0].content).toMatch(/did not allow/);
-        expect(refused.events.find((event) => event.type === 'toolFailed')).toMatchObject({ failed: 'refused' });
+        expect(toolTurns(state.chatCalls[1])[0].content).toBe('Mollama did not run Notes: write_page: it asked whether Notes: write_page may change things, and Refuse was chosen.\n\nDo not try another way to do the same thing; say that it was not done.');
+        expect(refused.events.find((event) => event.type === 'toolFailed')).toMatchObject({ failed: 'declined' });
 
         await turn('always');
         expect(called.length).toBe(1);
