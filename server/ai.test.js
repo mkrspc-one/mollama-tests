@@ -631,6 +631,7 @@ const resetState = () => {
         chatAborted: 0,
         chatHold: false,
         chatError: null,
+        chatErrors: [],
         streamErrors: [],
         chatFailsMidway: false,
         thinkingModel: false,
@@ -827,6 +828,8 @@ const fakeOllama = (host, signal) => ({
             throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
         }
         if (state.chatError) throw Object.assign(new Error(state.chatError), { error: state.chatError });
+        const wrong = state.chatErrors.shift();
+        if (wrong) throw Object.assign(new Error(wrong), { error: wrong });
         if (request.format) {
             const answer = (content) => {
                 const result = { message: { role: 'assistant', content }, done: true };
@@ -4574,7 +4577,7 @@ describe('Chat endpoints', () => {
             }
             // Mollama's own skills: the one that draws its viewers and the map of what each skill is for.
             expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components', 'skill-map']);
-            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer', 'cadsmith']);
+            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer', 'cadsmith']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
@@ -5226,6 +5229,11 @@ describe('Chat endpoints', () => {
                 expect(loose.told[0]).toMatch(/^Not shown yet\. 1 to fix in dial-indicator\.html:\nlines: line ends: 1 of 367 ends on 23 lines float\n {2}needle {2}end {2}nothing nearby\nEvery line ends on a stroke/);
                 expect(loose.told[1]).toMatch(/^Built dial-indicator\.html and showed it to the user in the chat, with 1 still to fix:\nlines: /);
 
+                // A value that is not a number is named with where it is drawn and the line that drew it.
+                outs.push({ out: 'PAGE dial-indicator.html\nWHERE build.mjs:62 at plate (build.mjs:62:16) Error: drawn at NaN\nPROBE {"errors":[],"drawn":362,"bad":2,"lost":["<path class=\\"iso-line\\" d=\\"MNaN 4\\">"]}\nline ends: 0 of 367 ends on 23 lines float\n' });
+                const lost = await turn([['anatomy_build', { code: `${example}\n// lost` }]]);
+                expect(lost.told[0]).toMatch(/^Not shown yet\. 2 to fix in dial-indicator\.html:\nrun: 2 things are drawn at NaN, undefined or Infinity: <path class="iso-line" d="MNaN 4">\.\nwhere: build\.mjs:62 at plate \(build\.mjs:62:16\) Error: drawn at NaN\nMend it with anatomy_change/);
+
                 // A page that fails when it is opened is never shown, and the person is told so in its place.
                 const failing = { out: 'PAGE dial-indicator.html\nPROBE {"errors":["Uncaught TypeError: needle.nope is undefined"],"drawn":362,"bad":false}\n' };
                 outs.push(failing, failing);
@@ -5384,6 +5392,87 @@ describe('Chat endpoints', () => {
                 delete process.env.SANDBOX_API_KEY;
                 delete process.env.SANDBOX_WORKSPACE_ID;
                 delete process.env.SANDBOX_SNAPSHOT;
+            }
+        });
+
+        test('the medical skills look things up in public records through this server, and say when a service has nothing or does not answer', async () => {
+            const asked = [];
+            let answer = () => ({});
+            const before = setRemoteTransport({
+                lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+                request: async (url) => {
+                    asked.push(url.href);
+                    const given = answer(url);
+                    const status = given?.status || 200;
+                    const body = typeof given === 'string' ? given : JSON.stringify(given);
+                    return { status, headers: { 'content-type': typeof given === 'string' ? 'text/xml' : 'application/json' }, stream: Readable.from([Buffer.from(body)]) };
+                }
+            });
+            const turn = async (skill, plan) => {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', skill] });
+                state.chatCalls.length = 0;
+                state.toolPlan = plan.map((call) => [call]);
+                const { events } = await send(chat.id, { content: 'look it up' });
+                return { told: plan.map((call, at) => state.chatCalls[at + 1].messages.at(-1).content), tools: state.chatCalls[0].tools.map((tool) => tool.function.name), events };
+            };
+            try {
+                // PubMed: the search, then the papers it found, with their abstracts.
+                answer = (url) => (url.pathname.endsWith('esearch.fcgi') ? { esearchresult: { count: '483', idlist: ['37622681'] } }
+                    : '<?xml version="1.0" ?><PubmedArticleSet><PubmedArticle><MedlineCitation><PMID Version="1">37622681</PMID><Article><Journal><JournalIssue><PubDate><Year>2023</Year></PubDate></JournalIssue><Title>The New England journal of medicine</Title></Journal><ArticleTitle>Semaglutide in <i>heart</i> failure &amp; obesity.</ArticleTitle><ELocationID EIdType="doi" ValidYN="Y">10.1056/x</ELocationID><Abstract><AbstractText Label="RESULTS">P&lt;0.001</AbstractText></Abstract><AuthorList><Author><LastName>Kosiborod</LastName><Initials>MN</Initials></Author></AuthorList><PublicationTypeList><PublicationType UI="D1">Randomized Controlled Trial</PublicationType></PublicationTypeList></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>');
+                const papers = await turn('medical-pubmed-literature-search', [['pubmed_search', { query: 'semaglutide "heart" failure)', kind: 'randomized controlled trial', from_year: 2020, max: 3 }]]);
+                expect(papers.tools).toContain('pubmed_search');
+                expect(new URL(asked[0]).searchParams.get('term')).toBe('(semaglutide heart failure) AND "randomized controlled trial"[Publication Type] AND 2020:3000[dp]');
+                expect(papers.told[0]).toBe('483 papers match; these are the first 1.\n\nSemaglutide in heart failure & obesity.\nKosiborod MN The New England journal of medicine, 2023. Randomized Controlled Trial.\nPMID 37622681, https://pubmed.ncbi.nlm.nih.gov/37622681/, doi 10.1056/x\nRESULTS: P<0.001');
+                expect(papers.events.some((event) => event.type === 'permission')).toBe(false);
+
+                // ClinicalTrials.gov: a search, and one study with who may join.
+                const study = { protocolSection: { identificationModule: { nctId: 'NCT06732414', briefTitle: 'A study' }, statusModule: { overallStatus: 'RECRUITING', startDateStruct: { date: '2025-01-28' } }, designModule: { phases: ['PHASE3'], enrollmentInfo: { count: 120 } }, eligibilityModule: { eligibilityCriteria: 'Adults with asthma' }, descriptionModule: { briefSummary: 'It tests.' } } };
+                answer = (url) => (url.pathname.endsWith('/studies') ? { totalCount: 376, studies: [study] } : study);
+                asked.length = 0;
+                const trials = await turn('medical-clinical-trials-search', [['trials_search', { condition: 'asthma', status: 'recruiting', phase: '3' }], ['trials_search', { nct_id: 'nct06732414' }]]);
+                expect(Object.fromEntries(new URL(asked[0]).searchParams)).toMatchObject({ 'query.cond': 'asthma', 'filter.overallStatus': 'RECRUITING', 'filter.advanced': 'AREA[Phase]PHASE3', pageSize: '6' });
+                expect(trials.told[0]).toMatch(/^376 studies match; these are the first 1\.\n\nNCT06732414: A study, https:\/\/clinicaltrials\.gov\/study\/NCT06732414\nrecruiting; phase 3; 120 people; from 2025-01-28\nIt tests\.$/);
+                expect(asked[1]).toBe('https://clinicaltrials.gov/api/v2/studies/NCT06732414?format=json');
+                expect(trials.told[1]).toContain('Who may join: Adults with asthma');
+
+                // openFDA: a part of the label, and counts of reports that are not taken for rates.
+                answer = (url) => (url.searchParams.get('count') === 'openfda.generic_name.exact' ? { results: [{ term: 'WARFARIN AND ASPIRIN', count: 90 }, { term: 'WARFARIN', count: 40 }] } : url.pathname.includes('label') ? { results: [{ effective_time: '20260101', openfda: { brand_name: ['COUMADIN'], generic_name: ['WARFARIN'] }, drug_interactions: ['Aspirin raises the risk of bleeding.'] }] } : { results: [{ term: 'DYSPNOEA', count: 8609 }] });
+                asked.length = 0;
+                const drug = await turn('medical-drug-interaction-checker', [['drug_facts', { drug: 'warfarin"', about: 'interactions' }], ['drug_facts', { drug: 'warfarin', about: 'reports' }]]);
+                // The drug by itself is read, not a combination that holds it.
+                expect(new URL(asked[0]).searchParams.get('search')).toBe('(openfda.generic_name:"warfarin" OR openfda.brand_name:"warfarin")');
+                expect(new URL(asked[1]).searchParams.get('search')).toBe('(openfda.generic_name:"warfarin" OR openfda.brand_name:"warfarin") AND openfda.generic_name.exact:"WARFARIN"');
+                expect(drug.told[0]).toBe('The label of COUMADIN, WARFARIN, effective 20260101:\n\nCombinations with warfarin have labels of their own, which this is not.\n\nDRUG INTERACTIONS\nAspirin raises the risk of bleeding.\n\nFrom openFDA, whose data is not checked for use in care: say so, and that a pharmacist or doctor decides. Other forms and strengths of a drug have labels of their own.');
+                expect(drug.told[1]).toMatch(/does not show that the drug caused it, and the counts are not rates\):\n- dyspnoea: 8,609/);
+
+                // Only a combination on record: it is read, and said to be one.
+                answer = (url) => (url.searchParams.get('count') ? { results: [{ term: 'SITAGLIPTIN AND METFORMIN', count: 9 }] } : { results: [{ openfda: { generic_name: ['SITAGLIPTIN AND METFORMIN'] }, indications_and_usage: ['For diabetes.'] }] });
+                expect((await turn('medical-fda-drug-information', [['drug_facts', { drug: 'janumet', about: 'uses' }]])).told[0]).toContain('janumet is a combination: sitagliptin and metformin.');
+                expect((await turn('medical-fda-drug-information', [['drug_facts', { drug: 'metformin', about: 'uses' }]])).told[0]).toContain('This is the label of a combination (sitagliptin and metformin), not of metformin alone: its doses are not metformin\'s.');
+
+                // ICD-10 codes and Medicare spending.
+                answer = (url) => (url.host === 'data.cms.gov' ? [{ Brnd_Name: 'Ozempic', Gnrc_Name: 'Semaglutide', Mftr_Name: 'Overall', Tot_Spndng_2024: '12970296347', Tot_Clms_2024: '10417182', Tot_Benes_2024: '1952637', Avg_Spnd_Per_Clm_2024: '1245.08' }, { Brnd_Name: 'Ozempic', Mftr_Name: 'Novo' }] : [19, ['J45.998'], null, [['J45.998', 'Other asthma']]]);
+                expect((await turn('medical-icd10-code-lookup', [['icd10_lookup', { terms: 'asthma' }]])).told[0]).toBe('19 codes match; these are the first 1.\n- J45.998: Other asthma');
+                expect((await turn('medical-medicare-drug-stats', [['medicare_drug_spending', { drug: 'ozempic' }]])).told[0]).toBe('Ozempic (Semaglutide), part d:\n- 2024: $12,970,296,347 in all, 10,417,182 claims, 1,952,637 people, $1,245 a claim\n\nFrom CMS. Spending is before rebates from makers.');
+
+                // A service with nothing on the words says so; one that does not answer is not taken for an answer.
+                answer = () => ({ status: 404 });
+                expect((await turn('medical-fda-drug-information', [['drug_facts', { drug: 'nosuchdrug', about: 'uses' }]])).told[0]).toBe('openFDA has nothing on that. Try other words, such as the generic name.');
+                answer = () => '<html>down</html>';
+                const down = await turn('medical-icd10-code-lookup', [['icd10_lookup', { terms: 'gout' }]]);
+                expect(down.told[0]).toBe('The ICD-10 table could not be read just now (it did not answer as expected). Say so; do not answer from memory as if it had been read.');
+                expect(down.events.find((event) => event.type === 'toolFailed')).toBeTruthy();
+
+                // A chat without such a skill has none of these.
+                const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'medical-board-exam-prep'] });
+                state.chatCalls.length = 0;
+                state.toolPlan = [];
+                await send(plain.id, { content: 'hello' });
+                expect((state.chatCalls[0].tools || []).map((tool) => tool.function.name)).not.toContain('pubmed_search');
+            } finally {
+                state.toolPlan = [];
+                setRemoteTransport(before);
+                setToolCallLimit(null);
             }
         });
 
@@ -5791,6 +5880,30 @@ describe('Chat endpoints', () => {
                 } finally {
                     setPermissionWait(null);
                 }
+            });
+
+            test('a service that says the request is too long is asked again with what was read put away, and only when nothing is left to put away does the reply end', async () => {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy'] });
+                const file = ['open_skill_file', { skill: 'anatomy-anatomy', file: 'examples/dial-indicator/build.mjs' }];
+                state.chatCalls.length = 0;
+                state.toolPlan = [[file]];
+                state.chatErrors = [null, 'request (9000 tokens) exceeds the available context size (8192 tokens)'];
+                state.chatReply = 'Here it is.';
+                const { events } = await send(chat.id, { content: 'draw it' });
+                expect(events.find((event) => event.type === 'note' && /more than the model can read at once/.test(event.text))).toBeTruthy();
+                expect(events.at(-1).reply.errorCode || null).toBe(null);
+                expect(events.at(-1).reply.content).toContain('Here it is.');
+                // Asked three times in all, the last time with the file cut to what fits.
+                expect(state.chatCalls).toHaveLength(3);
+                expect(state.chatCalls[2].messages.at(-1).content).toMatch(/\[Cut here: the last [\d,]+ characters/);
+
+                // Said again and again, it ends as before.
+                state.chatCalls.length = 0;
+                state.toolPlan = [];
+                state.chatErrors = Array.from({ length: 8 }, () => 'input exceeds the maximum context length');
+                const ended = await send(chat.id, { content: 'and again' });
+                expect(JSON.stringify(ended.events)).toContain('TOO_LONG');
+                state.chatErrors = [];
             });
 
             test('the same failing call is not run a third time, and other work is not held back', async () => {
@@ -7751,12 +7864,18 @@ describe('Tool servers', () => {
     });
 
     test('a skill that uses a tool server says so, and counts it as ready only once that server is ready on the account', async () => {
-        const skillOf = async () => (await client.get('/api/v1/skills', any)).data.skills.find((skill) => skill.id === 'context7-context7-mcp');
-        expect((await skillOf()).toolServers).toEqual([{ name: 'Context7', ready: false }]);
-        const added = await add({ name: 'Context7', address: 'https://mcp.context7.com/mcp' });
+        // Context7 is a tool people connect, so its skills are no longer in the library.
+        const listed = (await client.get('/api/v1/skills', any)).data.skills;
+        expect(listed.some((skill) => skill.source === 'context7' || skill.id.startsWith('context7'))).toBe(false);
+        expect(TOOL_CATALOGUE.find((entry) => entry.name === 'Context7').address).toBe('https://mcp.context7.com/mcp');
+        const one = listed.find((skill) => skill.toolServers.length > 0);
+        const name = one.toolServers[0].name;
+        const skillOf = async () => (await client.get('/api/v1/skills', any)).data.skills.find((skill) => skill.id === one.id);
+        expect(one.toolServers[0].ready).toBe(false);
+        const added = await add({ name, address: 'https://mcp.one.example/mcp' });
         expect(added.data.server.health.state).toBe('healthy');
-        expect((await skillOf()).toolServers).toEqual([{ name: 'Context7', ready: true }]);
-        expect((await client.get('/api/v1/skills/context7-context7-mcp', any)).data.skill.toolServers).toEqual([{ name: 'Context7', ready: true }]);
+        expect((await skillOf()).toolServers[0]).toEqual({ name, ready: true });
+        expect((await client.get(`/api/v1/skills/${one.id}`, any)).data.skill.toolServers[0]).toEqual({ name, ready: true });
     });
 
     test('an app that lists its tools oddly is still added and checked, with only what can be kept', async () => {
