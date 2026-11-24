@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, forgetWordy, readTextCalls, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -594,6 +594,8 @@ const installed = (name, sizeMb = 100) => ({
 
 const state = {};
 const resetState = () => {
+    setWordRoom(null);
+    forgetWordy();
     Object.assign(state, {
         up: true,
         models: [installed('qwen2.5-coder:7b', 4700), installed('custom-thing:latest', 50)],
@@ -632,6 +634,8 @@ const resetState = () => {
         chatHold: false,
         chatError: null,
         chatErrors: [],
+        template: null,
+        say: [],
         streamErrors: [],
         chatFailsMidway: false,
         thinkingModel: false,
@@ -755,7 +759,7 @@ const fakeOllama = (host, signal) => ({
         return {
             modelfile: `FROM ${model}`,
             parameters: 'temperature 0.7',
-            template: '{{ .Prompt }}',
+            template: state.template || '{{ .Prompt }}',
             capabilities: [...(state.noTools ? ['completion'] : state.thinkingModel ? ['completion', 'tools', 'thinking'] : ['completion', 'tools']), ...(state.vision ? ['vision'] : [])],
             model_info: { 'testfam.context_length': state.contextLength },
             details: { family: 'testfam' }
@@ -828,6 +832,16 @@ const fakeOllama = (host, signal) => ({
             throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
         }
         if (state.chatError) throw Object.assign(new Error(state.chatError), { error: state.chatError });
+        if (state.say.length > 0 && request.stream !== false) {
+            const { text, ended = 'stop' } = state.say.shift();
+            return {
+                abort() {},
+                async *[Symbol.asyncIterator]() {
+                    yield { message: { role: 'assistant', content: text } };
+                    yield { message: { role: 'assistant', content: '' }, done: true, done_reason: ended, eval_count: 3, prompt_eval_count: 20, total_duration: 2e8, eval_duration: 1e8 };
+                }
+            };
+        }
         const wrong = state.chatErrors.shift();
         if (wrong) throw Object.assign(new Error(wrong), { error: wrong });
         if (request.format) {
@@ -4374,6 +4388,7 @@ describe('Chat endpoints', () => {
 
         test('a model that cannot use tools is not offered them', async () => {
             await withKey(async () => {
+                setWordRoom(Infinity);
                 state.noTools = true;
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
@@ -4472,6 +4487,80 @@ describe('Chat endpoints', () => {
             });
         });
 
+        test('a call written as text is read in each common form, for any function offered, and words about a function are left alone', () => {
+            const tools = [
+                { function: { name: 'hairline_build', parameters: { properties: { code: { type: 'string' } }, required: ['code'] } } },
+                { function: { name: 'pubmed_search', parameters: { properties: { query: { type: 'string' }, max: { type: 'integer' } } } } }
+            ];
+            const search = { function: { name: 'pubmed_search', arguments: { query: 'heart failure', max: 3 } } };
+            const json = '{"name": "pubmed_search", "arguments": {"query": "heart failure", "max": 3}}';
+            const forms = [
+                json,
+                `<tool_call>\n${json}\n</tool_call>`,
+                '```json\n' + json + '\n```',
+                json.replace('arguments', 'parameters'),
+                `<|python_tag|>${json.replace('arguments', 'parameters')}<|eom_id|>`,
+                `[TOOL_CALLS] [${json}]</s>`.replace('</s>', ''),
+                '[TOOL_CALLS]pubmed_search[ARGS]{"query": "heart failure", "max": 3}',
+                `<|tool_call|>[${json}]<|/tool_call|>`,
+                '<tool_call>\n<function=pubmed_search>\n<parameter=query>\nheart failure\n</parameter>\n<parameter=max>\n3\n</parameter>\n</function>\n</tool_call>',
+                '<tool_call>pubmed_search\n<arg_key>query</arg_key>\n<arg_value>heart failure</arg_value>\n<arg_key>max</arg_key>\n<arg_value>3</arg_value>\n</tool_call>',
+                '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>pubmed_search\n```json\n{"query": "heart failure", "max": 3}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+                '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>pubmed_search<｜tool▁sep｜>{"query": "heart failure", "max": 3}<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+                '{"type": "function", "function": {"name": "pubmed_search", "arguments": "{\\"query\\": \\"heart failure\\", \\"max\\": 3}"}}',
+                '```tool_code\npubmed_search(query="heart failure", max=3)\n```',
+                '[pubmed_search(query=\'heart failure\', max=3)]'
+            ];
+            for (const form of forms) {
+                expect([form, readTextCalls(form, tools)]).toEqual([form, { calls: [search], text: '' }]);
+                expect([form, readTextCalls(`Let me look.\n\n${form}`, tools)]).toEqual([form, { calls: [search], text: 'Let me look.' }]);
+            }
+            // Code with braces, quotes and marks of its own comes through whole.
+            const code = 'const a = { b: "c" };\nif (a < 2) { d(`${a}`); }\nhairline({ name: "x" });';
+            expect(readTextCalls(`<function=hairline_build>\n<parameter=code>\n${code}\n</parameter>\n</function>`, tools).calls[0].function.arguments.code).toBe(code);
+            expect(readTextCalls(JSON.stringify({ name: 'hairline_build', arguments: { code } }), tools).calls[0].function.arguments.code).toBe(code);
+            // Two at the end, and one in marks with a guess at its result after it.
+            expect(readTextCalls(`${json}\n${json}`, tools).calls).toHaveLength(2);
+            expect(readTextCalls(`Looking.\n<tool_call>${json}</tool_call>\nThe search found 12 papers.`, tools)).toEqual({ calls: [search], text: 'Looking.' });
+            // Not calls: words about one, an example in the middle, an unknown function, input that lacks what it needs,
+            // a call cut off, and a component block.
+            for (const text of ['You could use pubmed_search(query) here.', `An example is ${json} and then you read it.`, '{"name": "delete_everything", "arguments": {}}', '{"name": "hairline_build", "arguments": {"title": "x"}}', '{"name": "pubmed_search", "arguments": {"query": "cut', '```component\n<Flow>\n<Node id="a" />\n</Flow>\n```', 'Plain words.', '']) {
+                expect([text, readTextCalls(text, tools)]).toEqual([text, { calls: [], text }]);
+            }
+        });
+
+        test('a model that lists no functions is told of them in words when it has room, and a service that refuses them is asked again in words', async () => {
+            setWordRoom(null);
+            state.noTools = true;
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+            state.chatCalls.length = 0;
+            state.say = [{ text: '<call name="open_skill_file"><arg name="skill">hairline-hairline-create</arg><arg name="file">rules.md</arg></call>' }, { text: 'Read.' }];
+            const { events } = await send(chat.id, { content: 'the rules?' });
+            expect(state.chatCalls[0].tools).toBeUndefined();
+            expect(state.chatCalls[0].messages[0].content).toContain('FUNCTIONS\nYou can call the functions listed below.');
+            expect(events.at(-1).reply.steps.map((step) => step.tool)).toEqual(['Skill file']);
+
+            // With too little room it is sent its skills in full instead, as before.
+            setWordRoom(100000);
+            state.chatCalls.length = 0;
+            await send(chat.id, { content: 'and now?' });
+            expect(state.chatCalls[0].messages[0].content).not.toContain('FUNCTIONS\n');
+            state.noTools = false;
+            setWordRoom(null);
+
+            // One that lists functions and then refuses a request with them.
+            const other = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+            state.chatCalls.length = 0;
+            state.chatErrors = ['registry.ollama.ai/library/tiny does not support tools'];
+            const refused = await send(other.id, { content: 'hello' });
+            expect(refused.events.at(-1).reply.errorCode || null).toBe(null);
+            expect(state.chatCalls).toHaveLength(2);
+            expect(state.chatCalls[0].tools.length).toBeGreaterThan(0);
+            expect(state.chatCalls[1].tools).toBeUndefined();
+            expect(state.chatCalls[1].messages[0].content).toContain('FUNCTIONS\n');
+            forgetWordy();
+        });
+
         test('tool calls written at the end of a reply are found, and anything else is left alone', () => {
             const call = '{"name": "web_search", "arguments": {"query": "a {b} \\"c\\""}}';
             const found = { function: { name: 'web_search', arguments: { query: 'a {b} "c"' } } };
@@ -4546,6 +4635,7 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_VALUES_PAGE.startsWith('COMPONENT VALUES\n')).toBe(true);
             expect(COMPONENT_VALUES_PAGE).toMatch(/\n- Badge: color = default, primary, secondary, tertiary, success, warning, error/);
             expect(COMPONENT_VALUES_PAGE.length).toBeLessThan(6000);
+            setWordRoom(Infinity);
             state.noTools = true;
             state.chatCalls.length = 0;
             const before = state.guidesSeen;
@@ -4659,6 +4749,7 @@ describe('Chat endpoints', () => {
                 expect(chat.skills).toEqual([skill.id]);
                 await send(chat.id, { content: 'hello' });
                 expect(state.chatCalls.at(-1).tools.find((tool) => tool.function.name === 'open_skill').function.description).toContain('- Plain talk: Answers in short plain sentences, one idea at a time.');
+                setWordRoom(Infinity);
                 state.noTools = true;
                 const plainChat = await newChat({ model: 'qwen2.5-coder:7b', skills: [skill.id] });
                 await send(plainChat.id, { content: 'hello' });
@@ -4737,6 +4828,7 @@ describe('Chat endpoints', () => {
             expect(listed[0].text).toBeUndefined();
 
             // A model that cannot use tools is sent each skill in full.
+            setWordRoom(Infinity);
             state.noTools = true;
             const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-copywriting', 'not-a-skill'] });
             expect(chat.skills).toEqual(['marketing-copywriting']);
@@ -4892,6 +4984,7 @@ describe('Chat endpoints', () => {
 
             // A model that cannot use tools is offered nothing.
             state.toolsSeen = [];
+            setWordRoom(Infinity);
             state.noTools = true;
             const plain = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(plain.id, { content: 'hello' });
@@ -5882,6 +5975,50 @@ describe('Chat endpoints', () => {
                 }
             });
 
+            test('a model whose template has no place for functions is told of them in words, calls them in words and is given back what they returned', async () => {
+                const tools = [{ function: { name: 'anatomy_build', parameters: { properties: { code: { type: 'string' }, files: { type: 'array' }, change: { type: 'array' }, minutes: { type: 'integer' } } } } }];
+                // Code needs no quoting, other kinds are read as what they are, and what is written after a call goes.
+                const read = readWordCalls('I will build it.\n```xml\n<call name="anatomy_build">\n<arg name="code">\nconst a = "x";\nif (a < 2 && b) { c(`${a}`); }\n</arg>\n<arg name="files">["/a.txt"]</arg>\n<arg name="minutes">7</arg>\n<arg name="change"><change><find>a < b</find><replace>a > b</replace></change></arg>\n</call>\n```\nThe function returned: done!', tools);
+                expect(read.calls).toEqual([{ function: { name: 'anatomy_build', arguments: { code: 'const a = "x";\nif (a < 2 && b) { c(`${a}`); }', files: ['/a.txt'], minutes: 7, change: [{ find: 'a < b', replace: 'a > b' }] } } }]);
+                expect(read.text).toBe('I will build it.');
+                expect(readWordCalls('No call here.', tools)).toEqual({ calls: [], text: 'No call here.', cut: null });
+                expect(readWordCalls('<call name="anatomy_build"><arg name="code">one\ntwo', tools, true)).toEqual({ calls: [], text: '', cut: { name: 'anatomy_build', text: '{"code":"one\\ntwo' } });
+                expect(readWordCalls('<call name="anatomy_build"><arg name="code">one', tools).calls[0].function.arguments).toEqual({ code: 'one' });
+
+                state.template = '{% for message in messages %}{% if message.role == "user" %}<|User|>{{ message.content }}{% endif %}{% endfor %}';
+                try {
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+                    state.chatCalls.length = 0;
+                    state.say = [{ text: 'I will look.\n<call name="open_skill_file">\n<arg name="skill">hairline-hairline-create</arg>\n<arg name="file">rules.md</arg>\n</call>\nIt says: ten rules.' }, { text: 'Here are the rules.' }];
+                    const { events } = await send(chat.id, { content: 'what are the rules?' });
+                    const [first, second] = state.chatCalls;
+                    expect(first.tools).toBeUndefined();
+                    expect(first.messages[0].role).toBe('system');
+                    expect(first.messages[0].content).toContain('FUNCTIONS\nYou can call the functions listed below.');
+                    expect(first.messages[0].content).toMatch(/\n- hairline_build\(code \(/);
+                    expect(second.messages.at(-2)).toEqual({ role: 'assistant', content: 'I will look.\n<call name="open_skill_file">\n<arg name="skill">hairline-hairline-create</arg>\n<arg name="file">rules.md</arg>\n</call>' });
+                    expect(second.messages.at(-1).role).toBe('user');
+                    expect(second.messages.at(-1).content).toMatch(/^open_skill_file returned:\n/);
+                    expect(second.messages.some((message) => message.role === 'tool' || message.tool_calls)).toBe(false);
+                    const reply = events.at(-1).reply;
+                    expect(reply.steps.map((step) => [step.tool, step.failed])).toEqual([['Skill file', null]]);
+                    expect(reply.content).toBe('I will look.\n\nHere are the rules.');
+
+                    // A model with a place for functions is sent them as functions.
+                    state.template = '{{ if .Tools }}{{ .Tools }}{{ end }}{{ range .Messages }}{{ .Role }}: {{ .Content }}{{ end }} and so on';
+                    state.chatCalls.length = 0;
+                    await send(chat.id, { content: 'and now?' });
+                    expect(state.chatCalls[0].tools.length).toBeGreaterThan(0);
+                    expect(state.chatCalls[0].messages[0].content).not.toContain('FUNCTIONS\n');
+                } finally {
+                    state.template = null;
+                    state.say = [];
+                }
+                // A script in a picture is a fault the model is told of.
+                expect(componentFaults('```component\n<Image>\n<svg></svg>\n<script>move()</script>\n</Image>\n```').faults[0]).toMatch(/^An Image is a still picture: the script in it never runs\./);
+                expect(componentFaults('```component\n<Image alt="x">\n<svg></svg>\n</Image>\n```').faults).toEqual([]);
+            });
+
             test('a service that says the request is too long is asked again with what was read put away, and only when nothing is left to put away does the reply end', async () => {
                 const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy'] });
                 const file = ['open_skill_file', { skill: 'anatomy-anatomy', file: 'examples/dial-indicator/build.mjs' }];
@@ -6705,7 +6842,7 @@ describe('Linked devices', () => {
                 if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN', detail: 'The pooled model stopped: the secondary computer at 10.9.4.20 could not be reached for 45 seconds.' });
                 send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'text/event-stream' } });
                 for (const piece of ['Pooled ', 'hello']) send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: piece } }] })}\n\n`).toString('base64') });
-                send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n`).toString('base64') });
+                send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: app.countsMessages ? Math.ceil(app.pooled.at(-1).body.messages.reduce((sum, one) => sum + String(one.content || '').length, 0) / 4) : 5, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n`).toString('base64') });
                 return send({ id: message.id, type: 'end' });
             }
             if (message.type === 'pool' && message.action === 'probe') {
@@ -7021,6 +7158,25 @@ describe('Linked devices', () => {
         expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [0.8], ctx: 16384 }]);
         expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
         expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
+
+        // A pooled model whose count shows its functions were not in its prompt is asked again with them in words, and from
+        // then on it is asked so at once.
+        mainApp.countsMessages = true;
+        mainApp.pooled.length = 0;
+        const wordy = await client.post('/api/v1/chats', { model: 'tiny:1b', device: pool.id });
+        const askWordy = async (content) => String((await client.client.post(`/api/v1/chats/${wordy.data.chat.id}/messages`, { content }, { responseType: 'text', validateStatus: () => true })).data).trim().split('\n').map((line) => JSON.parse(line));
+        const twice = await askWordy('Draw a vise');
+        expect(mainApp.pooled).toHaveLength(2);
+        expect(mainApp.pooled[0].body.tools.length).toBeGreaterThan(0);
+        expect(mainApp.pooled[1].body.tools).toBeUndefined();
+        expect(mainApp.pooled[1].body.messages[0].content).toContain('FUNCTIONS\nYou can call the functions listed below.');
+        expect(twice.some((event) => event.type === 'note' && /not shown its functions/.test(event.text))).toBe(true);
+        expect(twice.at(-1).reply.content.match(/Pooled hello/g)).toHaveLength(1);
+        mainApp.pooled.length = 0;
+        await askWordy('And again');
+        expect(mainApp.pooled).toHaveLength(1);
+        expect(mainApp.pooled[0].body.tools).toBeUndefined();
+        mainApp.countsMessages = false;
 
         // The memory list shows the pooled model on the primary computer, with who helps, and what the other one lends to.
         const held = (await client.get('/api/v1/devices/memory')).data;
@@ -8656,6 +8812,7 @@ describe('Tools in chats', () => {
         expect(state.chatCalls[0].tools).toBeUndefined();
 
         resetState();
+        setWordRoom(Infinity);
         state.noTools = true;
         state.toolsSeen = [];
         const chat = await newChat({ tools: ['calculator'] });
