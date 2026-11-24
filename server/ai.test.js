@@ -6327,6 +6327,19 @@ describe('Linked devices', () => {
         await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
     });
 
+    test('an app that starts again before its old link is seen to close is told its part in the pool again', async () => {
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('restarted-main');
+        const first = await fakeApp(id, key, { network: { addresses: [{ address: '10.9.9.10', prefix: 24, interface: 'Ethernet', wired: true }] } });
+        await client.put(`/api/v1/devices/${id}/pool`, { role: 'main' });
+        for (let tries = 0; tries < 60 && first.orders.at(-1)?.role !== 'main'; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        const again = await fakeApp(id, key, { network: { addresses: [{ address: '10.9.9.10', prefix: 24, interface: 'Ethernet', wired: true }] } });
+        again.ws.send(JSON.stringify({ type: 'pool-state', data: { build: 'b12591', role: 'off', setup: 'ready', lending: false, address: null, allow: [], port: 50052, detail: null } }));
+        for (let tries = 0; tries < 60 && again.orders.at(-1)?.role !== 'main'; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(again.orders.at(-1)).toMatchObject({ role: 'main' });
+        await client.put(`/api/v1/devices/${id}/pool`, { role: 'off' });
+    });
+
     test('a model that fits only pooled names the main computer it is downloaded to', async () => {
         await testStartup.loginAsUser('admin');
         const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Ethernet', wired: true }] });
