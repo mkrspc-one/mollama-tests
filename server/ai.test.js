@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, forgetWordy, readTextCalls, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -636,6 +636,8 @@ const resetState = () => {
         chatErrors: [],
         template: null,
         say: [],
+        saidPieces: 0,
+        saidStopped: 0,
         streamErrors: [],
         chatFailsMidway: false,
         thinkingModel: false,
@@ -739,7 +741,7 @@ const fakePull = (model) => {
     };
 };
 
-const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page'];
+const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'compress_context', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page'];
 const DEFAULT_SKILL_NAMES = SKILLS.filter((skill) => DEFAULT_LIBRARY_SKILLS[skill.id]).map((skill) => skill.name);
 const fakeOllama = (host, signal) => ({
     version: async () => {
@@ -835,9 +837,12 @@ const fakeOllama = (host, signal) => ({
         if (state.say.length > 0 && request.stream !== false) {
             const { text, ended = 'stop' } = state.say.shift();
             return {
-                abort() {},
+                abort() { state.saidStopped += 1; },
                 async *[Symbol.asyncIterator]() {
-                    yield { message: { role: 'assistant', content: text } };
+                    for (const piece of [].concat(text)) {
+                        state.saidPieces += 1;
+                        yield { message: { role: 'assistant', content: piece } };
+                    }
                     yield { message: { role: 'assistant', content: '' }, done: true, done_reason: ended, eval_count: 3, prompt_eval_count: 20, total_duration: 2e8, eval_duration: 1e8 };
                 }
             };
@@ -2787,7 +2792,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, list_my_files, read_my_file, save_to_files, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, compress_context, list_my_files, read_my_file, save_to_files, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -4318,6 +4323,50 @@ describe('Chat endpoints', () => {
             }
         });
 
+        test('a model frees its own room in the middle of a reply: what it read is put away, what it wrote in keep stays, and it is told when little is left', async () => {
+            const usual = state.contextLength;
+            try {
+                state.contextLength = 15000;
+                const file = ['open_skill_file', { skill: 'anatomy-anatomy', file: 'examples/dial-indicator/build.mjs' }];
+                const keep = 'kit functions: cameraOf(opts), slabOf(plan, z, h). Base 40 x 20. Next: write the script.';
+                const results = async (plan) => {
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy'] });
+                    state.chatCalls.length = 0;
+                    state.toolPlan = plan;
+                    const { events } = await send(chat.id, { content: 'draw it' });
+                    const { messages } = state.chatCalls.at(-1);
+                    return { told: messages.filter((message) => message.role === 'tool').map((message) => message.content), messages, reply: events.at(-1).reply };
+                };
+                state.chatReply = 'Drawn.';
+                const read = await results([[file], [['calculator', { expression: '1 + 1' }]]]);
+                expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toContain('compress_context');
+                expect(read.told[0]).toContain('iso-kit.mjs');
+                expect(read.told[1]).toMatch(/\[Room: about [\d,]+ of [\d,]+ tokens are left for what you write next\. compress_context frees about [\d,]+ more\.\]$/);
+
+                // Put away, and what it wrote is still in its own call; the same call gives the file back whole.
+                const pressed = await results([[file], [['compress_context', { keep }]]]);
+                expect(pressed.told[0]).toMatch(/^\[Put away to save room: what open_skill_file returned/);
+                expect(pressed.told[1]).toMatch(/^Put away: about [\d,]+ tokens are free again\./);
+                expect(JSON.stringify(pressed.messages.filter((message) => message.tool_calls))).toContain('Base 40 x 20');
+                const again = await results([[file], [['compress_context', { keep }]], [file], [['compress_context', { keep: 'short' }]]]);
+                expect(again.told[2]).toContain('iso-kit.mjs');
+                expect(again.told[3]).toMatch(/^Nothing was put away\. Write in keep what you still need/);
+                expect(again.reply.steps.map((step) => step.tool)).toEqual(['Skill file', 'Make room', 'Skill file', 'Make room']);
+
+                // A file that came with the skill is not given a second time, until the page is put away.
+                state.contextLength = 65536;
+                const skill = ['open_skill', { skill: 'Anatomy' }];
+                expect((await results([[skill]])).told[0]).toContain('iso-kit.mjs');
+                const { told } = await results([[skill], [file], [['compress_context', { keep }]], [file]]);
+                expect(told[0]).toMatch(/^\[Put away to save room/);
+                expect(told[1]).toMatch(/^You already have examples\/dial-indicator\/build\.mjs/);
+                expect(told[3]).toContain('iso-kit.mjs');
+            } finally {
+                state.contextLength = usual;
+                state.toolPlan = [];
+            }
+        });
+
         test('a model keeps notes with save_note: they go with every later message, a key replaces, and empty text removes', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.toolPlan = [[['save_note', { key: 'battery', text: '36 V, 14 Ah' }], ['save_note', { key: 'motor', text: '250 W hub' }]]];
@@ -4375,7 +4424,7 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'compress_context', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator']);
 
                 // It is always on: a chat that was once switched off searches like any other.
                 state.toolsSeen = [];
@@ -4485,6 +4534,13 @@ describe('Chat endpoints', () => {
                 expect(second.find((message) => message.tool_calls).tool_calls).toHaveLength(5);
                 expect(second.filter((message) => message.role === 'tool')).toHaveLength(5);
             });
+        });
+
+        test('fixed colours are found in what a model wrote, and the app\'s variables are not', () => {
+            const own = '<style>body{background:var(--app-background, #ffffff);color:var(--app-text)} .a{border-color:color-mix(in srgb, var(--app-text) 30%, transparent);box-shadow:0 1px 2px rgba(0,0,0,.1)}</style><svg><rect fill="var(--app-primary)"/><use href="#base"/><path stroke="currentColor" fill="none"/></svg><script>const c = "#4a5568";</script>';
+            expect(fixedColours(own)).toEqual({ count: 0, colours: [] });
+            expect(fixedColours('<svg><rect fill="#4A5568"/><rect fill="#4a5568"/><path stroke="red"/><g style="color: rgb(1, 2, 3)"/></svg>')).toEqual({ count: 4, colours: ['#4a5568', 'rgb(1, 2, 3)', 'red'] });
+            expect(fixedColours('<p>A red door, number #123 on the list</p>').colours).not.toContain('red');
         });
 
         test('a call written as text is read in each common form, for any function offered, and words about a function are left alone', () => {
@@ -4805,7 +4861,7 @@ describe('Chat endpoints', () => {
             const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
             await send(bare.id, { content: 'hello' });
             expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
-            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'compress_context', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -5114,7 +5170,7 @@ describe('Chat endpoints', () => {
             // The function stands in for the skill's own build command, and says so.
             const builder = state.chatCalls[0].tools.find((tool) => tool.function.name === 'hairline_build');
             expect(builder.function.description).toMatch(/^Does what `node build\.mjs <name>\.js` and `node validate\.mjs` do in the Hairline skill, without Node/);
-            expect(Object.keys(builder.function.parameters.properties)).toEqual(['code']);
+            expect(Object.keys(builder.function.parameters.properties)).toEqual(['code', 'unfinished']);
 
             // A file can be read only as far as the instructions ask: here the engine's index, not the code under it.
             const head = state.chatCalls[1].messages.at(-1).content;
@@ -5308,15 +5364,49 @@ describe('Chat endpoints', () => {
                 // by sending only what changes, and the mended script is what runs.
                 outs.push({ exit: 3, out: 'BUILD 1\nfile:///root/skills/anatomy/examples/figure/build.mjs:62\n  out.push(S(k.slab(PLATE)));\n\nTypeError: k.slab is not a function\n    at plate (file:///root/skills/anatomy/examples/figure/build.mjs:62:16)\n    at ModuleJob.run (node:internal/modules/esm/module_job:569:25)\n\nNode.js v22.11.0\n' });
                 const mended = await turn([['anatomy_build', { code: example }], ['anatomy_change', { change: [{ find: 'const WIDTH = 600;', replace: 'const WIDTH = 640;' }] }]]);
-                expect(mended.told[0]).toMatch(/^Nothing was shown: the build script failed\.\nbuild\.mjs:62\n {2}out\.push\(S\(k\.slab\(PLATE\)\)\);\n\nTypeError: k\.slab is not a function\n {4}at plate \(build\.mjs:62:16\)\nMend it with anatomy_change, sending only the lines that change\.\n\nWhat kit\/iso-kit\.mjs exports \(nothing else is in it\): /);
+                expect(mended.told[0]).toMatch(/^Nothing was shown: the build script failed\.\nbuild\.mjs:62\n {2}out\.push\(S\(k\.slab\(PLATE\)\)\);\n\nTypeError: k\.slab is not a function\n {4}at plate \(build\.mjs:62:16\)\nMend it with anatomy_change, sending only the lines that change\./);
+                expect(mended.told[0]).toContain('k.slab does not exist. Use slabOf');
                 expect(mended.told[0]).toContain('slabOf');
                 expect(mended.told[0]).not.toMatch(/ModuleJob|Node\.js v/);
                 expect(mended.told[1]).toMatch(/^Built dial-indicator\.html and showed it/);
                 expect(uploads.filter((one) => one.where === '/root/work/build.mjs').at(-1).data).toContain('const WIDTH = 640;');
                 expect(mended.reply.match(/<Frame /g)).toHaveLength(1);
 
+                // Each failed build is told every name the kit does not have, what to call instead and how, every time.
+                const made = `import * as k from "../../kit/iso-kit.mjs";\nconst base = k.box([40, 20, 8]);\nconst page = k.lathe(base);\nk.slabOf([1, 2], 3);`;
+                const guessed = (line, what) => `BUILD 1\nfile:///root/skills/anatomy/examples/figure/build.mjs:${line}\nTypeError: ${what}\n    at file:///root/skills/anatomy/examples/figure/build.mjs:${line}:16\n`;
+                outs.push({ exit: 3, out: guessed(2, 'k.box is not a function') }, { exit: 3, out: guessed(2, 'k.box is not a function') });
+                const names = await turn([['anatomy_build', { code: made }], ['anatomy_build', { code: `${made}\n// again` }]]);
+                for (const told of names.told) {
+                    expect(told).toContain('k.box does not exist. Use slabOf or extrude.');
+                    expect(told).toContain('k.lathe does not exist. lathe is in kit/lathe.mjs.');
+                    expect(told).toContain('- slabOf(plan, z, h, P, steps = 8, bevel = 0): A rounded box.');
+                    expect(told).toMatch(/All that kit\/iso-kit\.mjs exports \(nothing else is in it\): [\s\S]*solidSvg\(paths, \{ tone = "hi"/);
+                }
+                // A function called wrongly is given with its arguments and without the whole list, and so is one on the
+                // line a value that is not a number came from.
+                expect(kitHelp('import * as k from "../../kit/iso-kit.mjs";\nk.slabOf([1, 2], 3);', 'TypeError: x\n    at cameraOf (kit/iso-kit.mjs:7:1)\n    at build.mjs:2:3')).toBe('\n\nHow to call them:\n- slabOf(plan, z, h, P, steps = 8, bevel = 0): A rounded box.\n- cameraOf(P): The raw sines and cosines.\nA plan is { x, y, w, d, r }, a point is [x, y, z], a floor point is [x, y] and P is what fitProjection returns.');
+                expect(kitHelp('import { iso, build } from "../../kit/iso-kit.mjs";\niso.prism(1);', 'TypeError: iso.prism is not a function')).toMatch(/build does not exist\. Use pageHtml or plateHtml or figureSvg\.\niso\.prism does not exist\. Use slabOf or extrude\.\niso is one function of the kit, not the kit/);
+                expect(kitHelp('import * as k from "../../kit/iso-kit.mjs";\nsolidSvg(1);', 'ReferenceError: solidSvg is not defined')).toContain('solidSvg is in kit/iso-kit.mjs: write k.solidSvg.');
+                // The skill's own examples call nothing it lacks.
+                expect(kitHelp(example)).toBe('');
+
                 // A floating line goes back once and is shown the second time with what is left.
                 const floating = 'PAGE dial-indicator.html\nPROBE {"errors":[],"drawn":362,"bad":false}\nline ends: 1 of 367 ends on 23 lines float\n  needle  end  nothing nearby\nconsole: clean\n';
+                // Cut off for want of room: what there is stays and the model goes on from it, in parts if it likes.
+                const at = example.indexOf('\n', Math.floor(example.length / 2)) + 1;
+                const cutOff = JSON.stringify({ code: example.slice(0, at + 5) }).slice(0, -2);
+                state.chatCalls.length = 0;
+                const rest = example.slice(at);
+                const middle = rest.indexOf('\n', Math.floor(rest.length / 2)) + 1;
+                state.toolPlan = [{ cut: { name: 'anatomy_build', text: cutOff } }, [['anatomy_change', { add: rest.slice(0, middle), unfinished: true }]], [['anatomy_change', { add: rest.slice(middle) }]]];
+                uploads.length = 0;
+                const parts = (await send(chat.id, { content: 'draw it' })).events.at(-1).reply;
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/It is kept as far as you got: \d+ lines, ending with[\s\S]*Do not write it again\. Go on with anatomy_change: put what comes next in add, with unfinished set until the last part\.$/);
+                expect(state.chatCalls[2].messages.at(-1).content).toMatch(/^Kept, not built yet: \d+ lines so far\. Go on with add in anatomy_change/);
+                expect(parts.steps.map((step) => step.failed)).toEqual([null, null, null]);
+                expect(uploads.filter((one) => one.where === '/root/work/build.mjs').map((one) => one.data.replace(/\s+/g, ' ').trim())).toEqual([example.replace(/\s+/g, ' ').trim()]);
+
                 outs.push({ out: floating }, { out: floating });
                 const loose = await turn([['anatomy_build', { code: example }], ['anatomy_build', { code: `${example}\n// again` }]]);
                 expect(loose.told[0]).toMatch(/^Not shown yet\. 1 to fix in dial-indicator\.html:\nlines: line ends: 1 of 367 ends on 23 lines float\n {2}needle {2}end {2}nothing nearby\nEvery line ends on a stroke/);
@@ -5998,11 +6088,22 @@ describe('Chat endpoints', () => {
                     expect(first.messages[0].content).toMatch(/\n- hairline_build\(code \(/);
                     expect(second.messages.at(-2)).toEqual({ role: 'assistant', content: 'I will look.\n<call name="open_skill_file">\n<arg name="skill">hairline-hairline-create</arg>\n<arg name="file">rules.md</arg>\n</call>' });
                     expect(second.messages.at(-1).role).toBe('user');
-                    expect(second.messages.at(-1).content).toMatch(/^open_skill_file returned:\n/);
+                    expect(second.messages.at(-1).content).toMatch(/^\[Result of open_skill_file: instructions for you to work by\. The user did not write them, does not see them and does not want them explained\]\n[\s\S]*\n\[End of the result\. Go on with the request: do not write the result out again\.\]\n\nThe user's request, which you are still working on:\nwhat are the rules\?\n\nDo the next step of it now: call the function that does it, or answer\.$/);
                     expect(second.messages.some((message) => message.role === 'tool' || message.tool_calls)).toBe(false);
                     const reply = events.at(-1).reply;
                     expect(reply.steps.map((step) => [step.tool, step.failed])).toEqual([['Skill file', null]]);
                     expect(reply.content).toBe('I will look.\n\nHere are the rules.');
+
+                    // It is stopped as soon as its call is whole, or when it begins to write a result itself, so it never goes
+                    // on to make one up or to copy out the page it was given. The call is not part of the answer.
+                    state.say = [{ text: ['I will look.\n<ca', 'll name="open_skill_file">\n<arg name="skill">hairline-hairline-create</arg>\n<arg name="file">concepts.md</arg>\n</call>\n\n[Result', ' of open_skill_file]\nMade up', ' and on', ' and on'] }, { text: ['Here it is.', '\nopen_skill_file returned:\n', 'SKILL: copied out'] }];
+                    state.saidPieces = 0;
+                    state.saidStopped = 0;
+                    const stoppedAt = await send(chat.id, { content: 'and the concepts?' });
+                    expect([state.saidPieces, state.saidStopped]).toEqual([4, 2]);
+                    expect(stoppedAt.events.at(-1).reply.content).toBe('I will look.\n\nHere it is.');
+                    expect(stoppedAt.events.filter((event) => event.type === 'token').map((event) => event.text).join('')).not.toMatch(/arg name|Made up|copied out/);
+                    expect(stoppedAt.events.filter((event) => event.type === 'draft').map((event) => event.text).join('')).toContain('<arg name="file">concepts.md</arg>');
 
                     // A model with a place for functions is sent them as functions.
                     state.template = '{{ if .Tools }}{{ .Tools }}{{ end }}{{ range .Messages }}{{ .Role }}: {{ .Content }}{{ end }} and so on';
@@ -6194,6 +6295,19 @@ describe('Chat endpoints', () => {
                 expect(told[3]).toMatch(/^Lines 1 to /);
                 expect(mended.events.at(-1).reply.content.match(/<Frame /g)).toHaveLength(1);
                 expect(mended.events.at(-1).reply.steps[0].sent).toContain('viseSvg');
+
+                // A page with colours of its own goes back once: it would look the same in every theme. One change can
+                // replace a colour everywhere.
+                renders = 1;
+                uploaded.length = 0;
+                state.chatCalls.length = 0;
+                const tinted = '<html><head><link rel="stylesheet" href="kit.css" data-ve-kit></head><body><main><svg aria-label="A vise"><rect fill="#4a5568"/><rect fill="#4a5568"/><rect fill="#e53e3e"/></svg></main></body></html>';
+                state.toolPlan = [[['visual_explainer_render', { page: tinted, title: 'Tinted' }]], [['visual_explainer_change', { change: [{ find: '#4a5568', replace: 'var(--app-neutral)', all: true }, { find: '#e53e3e', replace: 'var(--app-error)' }] }]]];
+                await send(chat.id, { content: 'tint it' });
+                const said = state.chatCalls.at(-1).messages.filter((message) => message.role === 'tool').map((message) => message.content);
+                expect(said[0]).toMatch(/^Not shown yet\.[\s\S]*✗ colours: 3 fixed colours \(#4a5568, #e53e3e\) stay the same in every theme\. Replace each with one of the app's variables/);
+                expect(said[1]).toMatch(/^Rendered and showed "Tinted"/);
+                expect(uploaded.filter((one) => one.where === '/root/work/page.src.html').at(-1).text).toContain('<rect fill="var(--app-neutral)"/><rect fill="var(--app-neutral)"/><rect fill="var(--app-error)"/>');
 
                 // A long page is shown whole to the person but sent back to the model as one line.
                 body = 'x'.repeat(8000);
@@ -8607,7 +8721,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'compress_context', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -8798,7 +8912,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'compress_context', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
