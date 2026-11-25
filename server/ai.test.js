@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -1711,6 +1711,15 @@ describe('Model endpoints', () => {
             const ready = await seen('reply:finished');
             expect(ready.data).toMatchObject({ level: 'info', chatId: chat.id, path: `/chat/${chat.id}` });
             expect(ready.data.message).toContain('hello there');
+
+            // A reply that fails is told the same way, so it is seen from any page.
+            state.chatErrors = ['something broke in the model'];
+            await client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'and again' });
+            state.chatErrors = [];
+            const broken = await seen('reply:failed');
+            expect(broken.data).toMatchObject({ level: 'error', title: 'Reply failed', chatId: chat.id, path: `/chat/${chat.id}` });
+            expect(broken.data.message).toMatch(/^The reply in ".*" stopped\. \S/);
+            expect(broken.data.code).toBeTruthy();
             ws.close();
         });
 
@@ -2612,6 +2621,7 @@ describe('Chat endpoints', () => {
             const done = list[list.length - 1];
             expect(done).toMatchObject({ type: 'done', reply: { role: 'assistant', content: 'Hello there friend', stopped: false, error: null } });
             expect(done.reply.stats.tokensPerSecond).toBeGreaterThan(0);
+            expect(done.reply.stats).toMatchObject({ requests: 1, sentTokens: 20, readSeconds: 0, toolSeconds: 0, cachedTokens: null });
             expect(done.context).toMatchObject({ capacityTokens: 32768, warn: false });
 
             const saved = (await get(`/chats/${chat.id}`)).data.chat;
@@ -4326,7 +4336,7 @@ describe('Chat endpoints', () => {
         test('a model frees its own room in the middle of a reply: what it read is put away, what it wrote in keep stays, and it is told when little is left', async () => {
             const usual = state.contextLength;
             try {
-                state.contextLength = 15000;
+                state.contextLength = 13000;
                 const file = ['open_skill_file', { skill: 'anatomy-anatomy', file: 'examples/dial-indicator/build.mjs' }];
                 const keep = 'kit functions: cameraOf(opts), slabOf(plan, z, h). Base 40 x 20. Next: write the script.';
                 const results = async (plan) => {
@@ -5381,8 +5391,12 @@ describe('Chat endpoints', () => {
                     expect(told).toContain('k.box does not exist. Use slabOf or extrude.');
                     expect(told).toContain('k.lathe does not exist. lathe is in kit/lathe.mjs.');
                     expect(told).toContain('- slabOf(plan, z, h, P, steps = 8, bevel = 0): A rounded box.');
-                    expect(told).toMatch(/All that kit\/iso-kit\.mjs exports \(nothing else is in it\): [\s\S]*solidSvg\(paths, \{ tone = "hi"/);
                 }
+                // The kit's whole list comes once in a reply; the names and how to call them come every time.
+                expect(names.told[0]).toMatch(/All that kit\/iso-kit\.mjs exports \(nothing else is in it\): [\s\S]*solidSvg\(paths, \{ tone = "hi"/);
+                expect(names.told[1]).not.toContain('All that kit');
+                // Every failed script is told where: the lines its error names and the lines that hold the name.
+                expect(names.told[0]).toMatch(/Where that is in what you sent \(line: text\):\n {3}1: import \* as k[^\n]*\n {3}2: const base = k\.box\(\[40, 20, 8\]\);/);
                 // A function called wrongly is given with its arguments and without the whole list, and so is one on the
                 // line a value that is not a number came from.
                 expect(kitHelp('import * as k from "../../kit/iso-kit.mjs";\nk.slabOf([1, 2], 3);', 'TypeError: x\n    at cameraOf (kit/iso-kit.mjs:7:1)\n    at build.mjs:2:3')).toBe('\n\nHow to call them:\n- slabOf(plan, z, h, P, steps = 8, bevel = 0): A rounded box.\n- cameraOf(P): The raw sines and cosines.\nA plan is { x, y, w, d, r }, a point is [x, y, z], a floor point is [x, y] and P is what fitProjection returns.');
@@ -5390,6 +5404,49 @@ describe('Chat endpoints', () => {
                 expect(kitHelp('import * as k from "../../kit/iso-kit.mjs";\nsolidSvg(1);', 'ReferenceError: solidSvg is not defined')).toContain('solidSvg is in kit/iso-kit.mjs: write k.solidSvg.');
                 // The skill's own examples call nothing it lacks.
                 expect(kitHelp(example)).toBe('');
+
+                // A page that fails in the browser is told what the mistake means and where the name is in the script.
+                outs.push({ out: 'PAGE dial-indicator.html\nPROBE {"errors":["Uncaught SyntaxError: Identifier \'translateAlong\' has already been declared"],"drawn":0,"bad":false}\nline ends: 0 of 0 ends on 0 lines float\n' });
+                const twice = await turn([['anatomy_build', { code: `${example}\n// twice` }], ['anatomy_change', { change: [{ find: 'const WIDTH = 601;', replace: 'const WIDTH = 640;' }] }]]);
+                expect(twice.told[0]).toMatch(/^Not shown yet\. 1 to fix in dial-indicator\.html:\nrun: the figure fails when it is opened in a browser: Uncaught SyntaxError: Identifier 'translateAlong' has already been declared\nMend it with anatomy_change/);
+                expect(twice.told[0]).toContain("translateAlong is one of the kit's functions, and kitScript() already puts every one of them into the page under its own name.");
+                expect(twice.told[0]).toMatch(/Where that is in what you sent \(line: text\):\n +\d+: [^\n]*translateAlong/);
+                // A find text that is not there comes back with the nearest lines, so they need not be asked for.
+                expect(twice.told[1]).toMatch(/^Nothing was changed or built\. The find text of change 1 is not in it\. Copy it exactly; show returns its lines\.\nThe nearest lines are \d+ to \d+:\n[\s\S]*const WIDTH = 600;/);
+                // The same help is given to every skill's script: a Python error keeps to the model's own file.
+                expect(scriptHelp('import a\nx = 1\ny = z + 1\nprint(y)', 'Traceback (most recent call last):\n  File "/usr/lib/python3/runpy.py", line 1, in run\n  File "/root/job/main.py", line 3, in <module>\nNameError: name \'z\' is not defined')).toBe('\n\nWhere that is in what you sent (line: text):\n   1: import a\n   2: x = 1\n   3: y = z + 1\n   4: print(y)');
+                expect(scriptHelp(example, 'Nothing was built. The build script is too long.')).toBe('');
+                const riffle = fs.readFileSync(new URL('../../server/instructions/library/hairline/hairline-hairline-create/examples/riffle.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n').trim();
+                expect(kernelHelp(riffle)).toBe('');
+                expect(kernelHelp(riffle.replace('} = HL', ', registerTick } = HL'))).toMatch(/^\n\nregisterTick is not in HL\. The nearest is:\n- register\(stage, tick\): /);
+
+                // With little room a model is offered a skill's own functions and files only once it has opened it.
+                const small = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'anatomy-anatomy', 'hairline-hairline-create'], options: { num_ctx: 16384 } });
+                const offeredAt = (at) => state.chatCalls[at].tools.map((tool) => tool.function.name);
+                state.chatCalls.length = 0;
+                state.toolPlan = [[['open_skill', { skill: 'Anatomy' }]], [['hairline_build', { code: riffle }]]];
+                await send(small.id, { content: 'draw it' });
+                // (The functions of every chat are taken off what a test sees; what was really offered is in toolsSeen.)
+                expect(offeredAt(0)).toEqual(['open_skill']);
+                expect(state.toolsSeen.at(-3).map((tool) => tool.function.name)).toEqual(expect.arrayContaining(['open_component', 'open_skill', 'ask_user', 'save_note', 'compress_context']));
+                for (const later of ['anatomy_build', 'anatomy_change', 'hairline_build', 'run_program', 'change_program', 'open_skill_file']) expect(offeredAt(0)).not.toContain(later);
+                expect(state.chatCalls[0].tools.find((tool) => tool.function.name === 'open_skill').function.description).toContain('A skill\'s own functions and files are given to you when you open it.');
+                expect(offeredAt(1)).toEqual(expect.arrayContaining(['anatomy_build', 'anatomy_change', 'open_skill_file']));
+                for (const other of ['hairline_build', 'run_program', 'change_program']) expect(offeredAt(1)).not.toContain(other);
+                expect(state.chatCalls[1].messages.at(-1).content).toContain('YOU NOW HAVE this skill\'s own functions: open_skill_file, anatomy_build, anatomy_change.');
+                // Its files only, and never the skill's own tests.
+                const itsFiles = state.chatCalls[1].tools.find((tool) => tool.function.name === 'open_skill_file').function;
+                expect(itsFiles.parameters.properties.skill.enum).toEqual(['anatomy-anatomy']);
+                expect(itsFiles.description).toContain('examples/dial-indicator/build.mjs');
+                expect(itsFiles.description).not.toMatch(/\.test\.mjs|hairline-hairline-create/);
+                // A function that is not offered yet still runs when it is called.
+                expect(state.chatCalls[2].messages.at(-1).content).not.toMatch(/There is no function called/);
+                // The next reply of the chat starts with what the opened skill brought.
+                state.chatCalls.length = 0;
+                state.toolPlan = [];
+                await send(small.id, { content: 'and again' });
+                expect(offeredAt(0)).toEqual(expect.arrayContaining(['anatomy_build', 'anatomy_change', 'open_skill_file']));
+                expect(offeredAt(0)).not.toContain('hairline_build');
 
                 // A floating line goes back once and is shown the second time with what is left.
                 const floating = 'PAGE dial-indicator.html\nPROBE {"errors":[],"drawn":362,"bad":false}\nline ends: 1 of 367 ends on 23 lines float\n  needle  end  nothing nearby\nconsole: clean\n';
@@ -8569,7 +8626,7 @@ describe('Online model providers', () => {
                 { choices: [{ delta: { reasoning_content: 'Let me think. ' } }] },
                 { choices: [{ delta: { content: 'Hello ' } }] },
                 { choices: [{ delta: { content: [{ type: 'text', text: 'from online.' }] } }] },
-                { choices: [], usage: { prompt_tokens: 21, completion_tokens: 7 } },
+                { choices: [], usage: { prompt_tokens: 21, completion_tokens: 7 }, timings: { prompt_n: 6, prompt_ms: 3000, predicted_n: 7, predicted_ms: 2000, cache_n: 15 } },
                 '[DONE]'
             ]);
         }
@@ -8711,6 +8768,8 @@ describe('Online model providers', () => {
         expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('Hello from online.');
         const done = events.find((event) => event.type === 'done');
         expect(done.reply.content).toBe('Hello from online.');
+        // Where the time went is kept: reading, writing, and how much of what was sent the service had already read.
+        expect(done.reply.stats).toMatchObject({ requests: 1, sentTokens: 21, cachedTokens: 15, readSeconds: 3, writeSeconds: 2, toolSeconds: 0, tokensPerSecond: 3.5 });
         expect(done.reply.stats.evalCount).toBe(7);
         expect(done.reply.stats.promptEvalCount).toBe(21);
 
