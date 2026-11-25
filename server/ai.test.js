@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7035,7 +7035,7 @@ describe('Linked devices', () => {
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
             const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? (app.tags || TAGS) : message.path === '/api/ps' ? { models: app.running || [] }
-                : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: app.info || { 'llama.context_length': 8192 }, details: {} } : null;
+                : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: (typeof app.info === 'function' ? app.info(JSON.parse(message.body || '{}').model) : app.info) || { 'llama.context_length': 8192 }, details: {} } : null;
             if (!body) {
                 const notFound = () => {
                     send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
@@ -7102,11 +7102,60 @@ describe('Linked devices', () => {
         expect(trainSettings(jsonl.lessons, 'habits')).toEqual({ epochs: 15, lr: 0.0002, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' });
         const many = Array.from({ length: 800 }, (_, at) => [{ role: 'user', content: `Question ${at} ${'word '.repeat(150)}` }, { role: 'assistant', content: 'An answer.' }]);
         expect(trainSettings(many, 'facts')).toEqual({ epochs: 3, lr: 0.0002, batch: 4, maxLength: 512, r: 256, alpha: 256, quantization: 'none' });
-        expect(TRAIN_BASES.every((base) => /^[\w.-]+\/[\w.-]+$/.test(base.source) && base.gpuMb.facts >= base.gpuMb.habits)).toBe(true);
+        expect(TRAIN_BASES.every((base) => /^[\w.-]+\/[\w.-]+$/.test(base.source))).toBe(true);
+        // What a run takes grows with the model: the smallest is what was measured, facts take more than habits.
+        expect(trainNeeds(494032768, 'habits')).toEqual({ gpuMb: 2800, memoryMb: 3482, downloadMb: 1088 });
+        expect(trainNeeds(494032768, 'facts').gpuMb).toBe(3500);
+        expect([trainNeeds(7615616512, 'habits').gpuMb, trainNeeds(7615616512, 'facts').gpuMb, trainNeeds(32763876352, 'habits').gpuMb]).toEqual([6202, 19154, 23052]);
+    });
+
+    // Stands in for Hugging Face's public page of facts about a model.
+    const HUB = {
+        'qwen/qwen2.5-0.5b-instruct': { id: 'Qwen/Qwen2.5-0.5B-Instruct', gated: false, pipeline_tag: 'text-generation', safetensors: { total: 494032768 }, cardData: { license: 'apache-2.0' } },
+        'qwen/qwen2.5-7b-instruct': { id: 'Qwen/Qwen2.5-7B-Instruct', gated: false, pipeline_tag: 'text-generation', safetensors: { total: 7615616512 }, cardData: { license: 'apache-2.0' } },
+        'acme/big-one-32b': { id: 'acme/Big-One-32B', gated: false, pipeline_tag: 'text-generation', safetensors: { total: 32763876352 }, cardData: {} },
+        'meta-llama/llama-3.2-3b-instruct': { id: 'meta-llama/Llama-3.2-3B-Instruct', gated: 'manual', pipeline_tag: 'text-generation', safetensors: { total: 3212749824 } },
+        'someone/qwen-gguf': { id: 'someone/qwen-gguf', gated: false, pipeline_tag: 'text-generation' },
+        'qwen/qwen3.5-27b': { id: 'Qwen/Qwen3.5-27B', gated: false, pipeline_tag: 'image-text-to-text', safetensors: { total: 27781427952 } }
+    };
+    const hubAsked = [];
+    const fakeHub = async (address) => {
+        hubAsked.push(address);
+        const found = HUB[address.replace('https://huggingface.co/api/models/', '').toLowerCase()];
+        return { status: found ? 200 : 401, json: async () => found || { error: 'Invalid username or password.' } };
+    };
+
+    test('any chat model on Hugging Face can be named for training: its facts are read from its public page, and what cannot be trained says why', async () => {
+        setTrainFetch(fakeHub);
+        try {
+            expect(await trainBase('Qwen/Qwen2.5-7B-Instruct')).toEqual({ source: 'Qwen/Qwen2.5-7B-Instruct', label: 'Qwen2.5 7B', parameters: 7615616512, licence: 'apache-2.0', tried: false });
+            // A page address works as well as a name, a model not in the suggestions is named after itself, and the facts are kept a while.
+            expect(await trainBase('https://huggingface.co/acme/big-one-32b/')).toMatchObject({ source: 'acme/Big-One-32B', label: 'Big-One-32B', licence: null });
+            const asked = hubAsked.length;
+            await trainBase('qwen/qwen2.5-7b-instruct');
+            expect(hubAsked).toHaveLength(asked);
+            expect(hubAsked.every((address) => /^https:\/\/huggingface\.co\/api\/models\/[\w.-]+\/[\w.-]+$/.test(address))).toBe(true);
+            expect((await trainBase('meta-llama/Llama-3.2-3B-Instruct')).problem).toMatch(/^meta-llama\/Llama-3\.2-3B-Instruct can be downloaded only after agreeing to its makers' terms/);
+            expect((await trainBase('someone/qwen-gguf')).problem).toMatch(/is not a chat model in the form training needs/);
+            expect((await trainBase('Qwen/Qwen3.5-27B')).problem).toBe('Qwen/Qwen3.5-27B also takes pictures or sound, and training a model of that kind is not built yet. Choose one that works with text alone.');
+            // Where a downloaded model came from is worked out from what its own file says, surest clue first.
+            expect(trainCandidates({ 'general.license.link': 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/LICENSE', 'general.base_model.0.repo_url': 'https://huggingface.co/Qwen/Qwen2.5-0.5B', 'general.finetune': 'Instruct', 'general.basename': 'Qwen2.5', 'general.size_label': '0.5B', 'general.base_model.0.organization': 'Qwen' })).toEqual(['Qwen/Qwen2.5-0.5B-Instruct', 'Qwen/Qwen2.5-0.5B']);
+            expect(trainCandidates({ 'general.basename': 'DeepSeek-R1-Distill-Qwen', 'general.size_label': '32B' })).toEqual(['deepseek-ai/DeepSeek-R1-Distill-Qwen-32B']);
+            expect(trainCandidates({ 'general.architecture': 'llama', 'general.parameter_count': 70553804800 })).toEqual([]);
+            expect(trainCandidates({ 'general.license.link': 'https://evil.example/a/b', 'general.basename': '../x' })).toEqual([]);
+            expect((await trainBase('nobody/nothing')).problem).toBe('There is no model called nobody/nothing on Hugging Face. Copy its name from its page there.');
+            // Nothing but a maker and a name is ever sent.
+            for (const odd of ['qwen2.5:7b', '../../etc/passwd', 'a/b/c', 'a b/c', 'a/b?x=1', '']) expect((await trainBase(odd)).problem).toMatch(/^Name the model as it is on Hugging Face/);
+            setTrainFetch(async () => { throw new Error('offline'); });
+            expect((await trainBase('Qwen/Qwen2.5-7B-Instruct')).problem).toMatch(/^Hugging Face could not be reached/);
+        } finally {
+            setTrainFetch();
+        }
     });
 
     test('a model is trained on a person\'s own computer: the lessons are checked, the desktop app is sent the run, and what it reports becomes the record', async () => {
         await testStartup.loginAsUser('admin');
+        setTrainFetch(fakeHub);
         const pc = await link('train-pc');
         const app = await fakeApp(pc.id, pc.key);
         const orders = [];
@@ -7126,7 +7175,7 @@ describe('Linked devices', () => {
         const mine = async () => (await list()).computers.find((one) => one.id === pc.id);
         const say = (data) => app.ws.send(JSON.stringify({ type: 'train-state', data }));
         const lessons = Array.from({ length: 24 }, (_, at) => `Q: What is rule ${at}?\nA: Rule ${at} says be kind.`).join('\n\n');
-        const start = (body = {}) => client.post('/api/v1/trainings', { device: pc.id, base: 'qwen2.5:0.5b', name: 'kind-helper', kind: 'habits', lessons, ...body }, { validateStatus: () => true });
+        const start = (body = {}) => client.post('/api/v1/trainings', { device: pc.id, base: 'Qwen/Qwen2.5-0.5B-Instruct', name: 'kind-helper', kind: 'habits', lessons, ...body }, { validateStatus: () => true });
 
         // An app that has said nothing about training is too old for it; one with no NVIDIA card cannot train yet.
         expect(await mine()).toMatchObject({ ready: false, reason: 'Update the desktop app on this computer: its version cannot train yet.' });
@@ -7137,10 +7186,45 @@ describe('Linked devices', () => {
         await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce GTX 1650', memoryMb: 4096 }], 'hardware.gpuMemoryMb': 4096 } });
         expect(await mine()).toMatchObject({ ready: true, reason: 'The first run sets training up on this computer: about 5 GB, asked for there.' });
         // What does not fit that card is refused before anything is sent, and so are lessons that cannot teach.
-        expect((await start({ kind: 'facts' })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: 'Qwen2.5 0.5B needs about 5 GB on the graphics card to learn facts, and this computer\'s has 4 GB. Choose a smaller model.' });
-        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce RTX 4060 Ti', memoryMb: 8188 }], 'hardware.gpuMemoryMb': 8188 } });
+        const fitOf = async (source, kind) => (await client.get(`/api/v1/trainings/base?device=${pc.id}&source=${encodeURIComponent(source)}&kind=${kind}`)).data;
+        expect((await start({ base: 'Qwen/Qwen2.5-7B-Instruct' })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: 'Qwen2.5 7B (7.6B) needs about 6 GB on the graphics card to learn habits, and this computer\'s has 4 GB. Choose a smaller model.' });
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce RTX 4060 Ti', memoryMb: 8188 }], 'hardware.gpuMemoryMb': 8188, 'hardware.memoryMb': 32768 } });
+        // The page can ask what a model would take of a computer before anything is started.
+        expect(await fitOf('Qwen/Qwen2.5-0.5B-Instruct', 'facts')).toMatchObject({ fits: true, reason: null, base: { label: 'Qwen2.5 0.5B', parameters: 494032768, tried: true }, needs: { gpuMb: 3500, memoryMb: 3482, downloadMb: 1088 } });
+        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'habits')).toMatchObject({ fits: true, needs: { gpuMb: 6202 } });
+        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'facts')).toMatchObject({ fits: false, reason: 'Qwen2.5 7B (7.6B) needs about 19 GB on the graphics card to learn facts, and this computer\'s has 8 GB. It would fit as Habits.' });
+        expect(await fitOf('acme/big-one-32b', 'habits')).toMatchObject({ fits: false, reason: 'Big-One-32B (32.8B) needs about 23 GB on the graphics card to learn habits, and this computer\'s has 8 GB. Choose a smaller model.' });
+        expect(await fitOf('meta-llama/Llama-3.2-3B-Instruct', 'habits')).toMatchObject({ fits: false, base: null, reason: expect.stringContaining('agreeing to its makers') });
+        // The Train tab's list: every model downloaded on the computer, with whether it can be trained there and why not.
+        const INFOS = {
+            'qwen2.5:0.5b': { 'general.parameter_count': 494032768, 'general.license.link': 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/LICENSE' },
+            'big-one:32b': { 'general.parameter_count': 32763876352, 'general.basename': 'Big-One', 'general.size_label': '32B', 'general.organization': 'acme' },
+            'llama3.2:3b': { 'general.parameter_count': 3212749824, 'general.license.link': 'https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct/blob/main/LICENSE' },
+            'qwen3.5:27b': { 'general.parameter_count': 26895998464, 'general.license.link': 'https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/LICENSE' },
+            'mystery:7b': { 'general.parameter_count': 7000000000, 'general.architecture': 'llama' },
+            'nomic-embed-text:latest': { 'general.parameter_count': 136727040 }
+        };
+        app.tags = { models: Object.keys(INFOS).map((name, at) => ({ ...TAGS.models[0], name, model: name, size: (at + 1) * 400 * 1024 * 1024 })) };
+        app.info = (name) => INFOS[name];
+        const shownModels = (await client.get(`/api/v1/trainings/models?device=${pc.id}&kind=habits`)).data;
+        expect(shownModels.computer).toMatchObject({ name: 'train-pc', ready: true, gpuMb: 8188, memoryMb: 32768 });
+        const stateOf = (name) => shownModels.models.find((one) => one.name === name);
+        expect(stateOf('qwen2.5:0.5b')).toMatchObject({ state: 'ready', source: 'Qwen/Qwen2.5-0.5B-Instruct', licence: 'apache-2.0', sizeMb: 400, reason: null, needs: { gpuMb: 2800 } });
+        // Too large for this card: it says how large a card would do, which is what a rented one will be chosen by.
+        expect(stateOf('big-one:32b')).toMatchObject({ state: 'card', source: 'acme/Big-One-32B', cardMb: 23052, reason: expect.stringContaining('needs about 23 GB on the graphics card') });
+        expect(stateOf('llama3.2:3b')).toMatchObject({ state: 'terms', reason: expect.stringContaining('agreeing to its makers') });
+        expect(stateOf('qwen3.5:27b')).toMatchObject({ state: 'kind', reason: expect.stringContaining('pictures or sound') });
+        expect(stateOf('mystery:7b')).toMatchObject({ state: 'origin', reason: expect.stringContaining('could not find where this model') });
+        expect(stateOf('nomic-embed-text:latest')).toMatchObject({ state: 'other', reason: expect.stringContaining('does not chat') });
+        app.tags = null;
+        app.info = null;
+        // A model that trains on the card still needs the memory to be made into one file at the end.
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.memoryMb': 16384 } });
+        expect((await fitOf('Qwen/Qwen2.5-7B-Instruct', 'habits')).reason).toBe('Qwen2.5 7B (7.6B) needs about 24 GB of memory to be made into one file at the end, and this computer has 16 GB. Choose a smaller model.');
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.memoryMb': 32768 } });
         expect((await start({ lessons: 'Q: one?\nA: yes' })).data).toMatchObject({ code: 'TRAIN_LESSONS', message: 'There is 1 lesson here. Training needs at least 20: fewer teach nothing that lasts.' });
-        expect((await start({ base: 'llama9:900b' })).data).toMatchObject({ code: 'TRAIN_BASE_UNKNOWN' });
+        expect((await start({ base: 'llama9:900b' })).data).toMatchObject({ code: 'TRAIN_BASE_UNKNOWN', message: expect.stringContaining('Name the model as it is on Hugging Face') });
+        expect((await start({ base: 'nobody/nothing' })).data).toMatchObject({ code: 'TRAIN_BASE_UNKNOWN' });
         expect((await start({ name: 'Bad Name!' })).status).toBe(400);
         app.tags = { models: [{ ...TAGS.models[0], name: 'kind-helper:latest', model: 'kind-helper:latest' }] };
         expect((await start()).data).toMatchObject({ code: 'TRAIN_NAME_TAKEN' });
@@ -7151,9 +7235,9 @@ describe('Linked devices', () => {
         // The run goes to the desktop app with everything it needs: the lessons, the settings, and what to ask before and after.
         const begun = await start();
         expect(begun.status).toBe(202);
-        expect(begun.data.training).toMatchObject({ name: 'kind-helper', base: 'qwen2.5:0.5b', kind: 'habits', lessons: 24, status: 'queued', percent: 0 });
+        expect(begun.data.training).toMatchObject({ name: 'kind-helper', base: 'Qwen/Qwen2.5-0.5B-Instruct', kind: 'habits', lessons: 24, status: 'queued', percent: 0 });
         const order = await until(() => orders.find((one) => one.action === 'run'));
-        expect(order.job).toMatchObject({ id: begun.data.training.id, name: 'kind-helper', base: 'qwen2.5:0.5b', source: 'Qwen/Qwen2.5-0.5B-Instruct', settings: { epochs: 15, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' } });
+        expect(order.job).toMatchObject({ id: begun.data.training.id, name: 'kind-helper', source: 'Qwen/Qwen2.5-0.5B-Instruct', shrink: false, settings: { epochs: 15, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' } });
         expect([order.job.lessons.length, order.job.probes.length, order.job.ordinary.length, order.job.control.length]).toEqual([24, 20, 60, 15]);
         expect(order.job.probes[0]).toEqual({ messages: [{ role: 'user', content: 'What is rule 0?' }], answer: 'Rule 0 says be kind.' });
         // The lessons are sent to the computer and not kept on the server; one computer trains one model at a time.
@@ -7188,6 +7272,7 @@ describe('Linked devices', () => {
         expect((await list()).trainings).toEqual([]);
         expect((await client.post(`/api/v1/trainings/${done.id}/stop`, {}, { validateStatus: () => true })).status).toBe(404);
         expect((await start()).status).toBe(404);
+        setTrainFetch();
     });
 
     test('a person sees which of their linked computers can pool, read from what each desktop app reports when it connects', async () => {
