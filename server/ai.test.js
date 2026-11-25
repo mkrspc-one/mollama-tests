@@ -15,8 +15,8 @@ import {
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
+import { readLessons, trainSettings, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7081,6 +7081,113 @@ describe('Linked devices', () => {
         // Another home with the same private addresses is not the same network.
         expect(Object.fromEntries(left.map((one) => [one.id, one.reason]))).toEqual({ away: 'alone', cafe: 'public', asleep: 'offline', resting: 'paused', old: 'update' });
         expect(left.find((one) => one.id === 'cafe').message).toMatch(/Public/);
+    });
+
+    test('lessons are read from lines of JSON or from plain text, and what is wrong with them is said plainly', () => {
+        const pairs = Array.from({ length: 24 }, (_, at) => ({ question: `What is rule ${at}?`, answer: `Rule ${at} says be kind.` }));
+        const jsonl = readLessons(pairs.map((one) => JSON.stringify(one)).join('\n'));
+        expect(jsonl.lessons).toHaveLength(24);
+        expect(jsonl.lessons[0]).toEqual([{ role: 'user', content: 'What is rule 0?' }, { role: 'assistant', content: 'Rule 0 says be kind.' }]);
+        // Chat-shaped lessons keep their system line; a lesson that does not end with an answer is counted, not used.
+        const chats = [...pairs.map((one) => ({ messages: [{ role: 'system', content: 'Be brief.' }, { role: 'user', content: one.question }, { role: 'assistant', content: one.answer }] })), { messages: [{ role: 'user', content: 'no answer' }] }];
+        const shaped = readLessons(JSON.stringify(chats));
+        expect([shaped.lessons.length, shaped.unread, shaped.lessons[0][0].role]).toEqual([24, 1, 'system']);
+        // Plain text: a question and its answer in each block, marked or not. The same lesson twice is one lesson.
+        const plain = readLessons([...pairs, pairs[0]].map((one, at) => (at % 2 ? `Q: ${one.question}\nA: ${one.answer}` : `${one.question}\n${one.answer}`)).join('\n\n'));
+        expect(plain.lessons).toEqual(jsonl.lessons);
+        expect(readLessons('').problem).toMatch(/^Give the lessons/);
+        expect(readLessons('Q: one?\nA: yes').problem).toBe('There is 1 lesson here. Training needs at least 20: fewer teach nothing that lasts.');
+        expect(readLessons('x'.repeat(1000001)).problem).toMatch(/^The lessons are too long/);
+        // About the same number of updates whatever the size, and rows as long as the longest lesson.
+        expect(trainSettings(jsonl.lessons, 'habits')).toEqual({ epochs: 15, lr: 0.0002, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' });
+        const many = Array.from({ length: 800 }, (_, at) => [{ role: 'user', content: `Question ${at} ${'word '.repeat(150)}` }, { role: 'assistant', content: 'An answer.' }]);
+        expect(trainSettings(many, 'facts')).toEqual({ epochs: 3, lr: 0.0002, batch: 4, maxLength: 512, r: 256, alpha: 256, quantization: 'none' });
+        expect(TRAIN_BASES.every((base) => /^[\w.-]+\/[\w.-]+$/.test(base.source) && base.gpuMb.facts >= base.gpuMb.habits)).toBe(true);
+    });
+
+    test('a model is trained on a person\'s own computer: the lessons are checked, the desktop app is sent the run, and what it reports becomes the record', async () => {
+        await testStartup.loginAsUser('admin');
+        const pc = await link('train-pc');
+        const app = await fakeApp(pc.id, pc.key);
+        const orders = [];
+        app.ws.addEventListener('message', (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'train') orders.push(message);
+        });
+        const until = async (check) => {
+            for (let tries = 0; tries < 80; tries += 1) {
+                const found = await check();
+                if (found) return found;
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            throw new Error('never happened');
+        };
+        const list = async () => (await client.get('/api/v1/trainings')).data;
+        const mine = async () => (await list()).computers.find((one) => one.id === pc.id);
+        const say = (data) => app.ws.send(JSON.stringify({ type: 'train-state', data }));
+        const lessons = Array.from({ length: 24 }, (_, at) => `Q: What is rule ${at}?\nA: Rule ${at} says be kind.`).join('\n\n');
+        const start = (body = {}) => client.post('/api/v1/trainings', { device: pc.id, base: 'qwen2.5:0.5b', name: 'kind-helper', kind: 'habits', lessons, ...body }, { validateStatus: () => true });
+
+        // An app that has said nothing about training is too old for it; one with no NVIDIA card cannot train yet.
+        expect(await mine()).toMatchObject({ ready: false, reason: 'Update the desktop app on this computer: its version cannot train yet.' });
+        expect((await start()).data).toMatchObject({ code: 'TRAIN_NOT_READY' });
+        say({ kit: 'none', job: null });
+        await until(async () => /NVIDIA/.test((await mine()).reason));
+        expect(await mine()).toMatchObject({ ready: false, reason: 'Training needs an NVIDIA graphics card for now, and this computer has none.' });
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce GTX 1650', memoryMb: 4096 }], 'hardware.gpuMemoryMb': 4096 } });
+        expect(await mine()).toMatchObject({ ready: true, reason: 'The first run sets training up on this computer: about 5 GB, asked for there.' });
+        // What does not fit that card is refused before anything is sent, and so are lessons that cannot teach.
+        expect((await start({ kind: 'facts' })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: 'Qwen2.5 0.5B needs about 5 GB on the graphics card to learn facts, and this computer\'s has 4 GB. Choose a smaller model.' });
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce RTX 4060 Ti', memoryMb: 8188 }], 'hardware.gpuMemoryMb': 8188 } });
+        expect((await start({ lessons: 'Q: one?\nA: yes' })).data).toMatchObject({ code: 'TRAIN_LESSONS', message: 'There is 1 lesson here. Training needs at least 20: fewer teach nothing that lasts.' });
+        expect((await start({ base: 'llama9:900b' })).data).toMatchObject({ code: 'TRAIN_BASE_UNKNOWN' });
+        expect((await start({ name: 'Bad Name!' })).status).toBe(400);
+        app.tags = { models: [{ ...TAGS.models[0], name: 'kind-helper:latest', model: 'kind-helper:latest' }] };
+        expect((await start()).data).toMatchObject({ code: 'TRAIN_NAME_TAKEN' });
+        app.tags = null;
+        // (A computer that connects is asked how any run it holds is doing; nothing has been sent to run.)
+        expect(orders.filter((one) => one.action === 'run')).toHaveLength(0);
+
+        // The run goes to the desktop app with everything it needs: the lessons, the settings, and what to ask before and after.
+        const begun = await start();
+        expect(begun.status).toBe(202);
+        expect(begun.data.training).toMatchObject({ name: 'kind-helper', base: 'qwen2.5:0.5b', kind: 'habits', lessons: 24, status: 'queued', percent: 0 });
+        const order = await until(() => orders.find((one) => one.action === 'run'));
+        expect(order.job).toMatchObject({ id: begun.data.training.id, name: 'kind-helper', base: 'qwen2.5:0.5b', source: 'Qwen/Qwen2.5-0.5B-Instruct', settings: { epochs: 15, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' } });
+        expect([order.job.lessons.length, order.job.probes.length, order.job.ordinary.length, order.job.control.length]).toEqual([24, 20, 60, 15]);
+        expect(order.job.probes[0]).toEqual({ messages: [{ role: 'user', content: 'What is rule 0?' }], answer: 'Rule 0 says be kind.' });
+        // The lessons are sent to the computer and not kept on the server; one computer trains one model at a time.
+        expect(JSON.stringify(await Training.findById(begun.data.training.id))).not.toContain('says be kind');
+        expect((await start({ name: 'another-one' })).data).toMatchObject({ code: 'TRAIN_BUSY' });
+
+        // What the app reports becomes the record, and only for a run of that computer.
+        say({ kit: 'ready', job: { id: begun.data.training.id, status: 'training', stage: 'Training', percent: 40.4, loss: 1.2345, before: { recalled: 2, of: 20, kept: 12, keptOf: 12 } } });
+        const midway = await until(async () => (await list()).trainings.find((one) => one.status === 'training'));
+        expect(midway).toMatchObject({ stage: 'Training', percent: 40, loss: 1.235, before: { recalled: 2, of: 20, kept: 12, keptOf: 12 }, after: null });
+        expect((await client.delete(`/api/v1/trainings/${midway.id}`, { validateStatus: () => true })).data).toMatchObject({ code: 'TRAIN_RUNNING' });
+        say({ kit: 'ready', job: { id: begun.data.training.id, status: 'done', stage: null, seconds: 141.6, after: { recalled: 18, of: 20, kept: 12, keptOf: 12 }, detail: 'x'.repeat(900) } });
+        const done = await until(async () => (await list()).trainings.find((one) => one.status === 'done'));
+        expect(done).toMatchObject({ percent: 100, seconds: 142, after: { recalled: 18, of: 20, kept: 12, keptOf: 12 } });
+        expect(done.detail).toHaveLength(400);
+        expect(done.finishedAt).toBeTruthy();
+        // A report after the end changes nothing.
+        say({ kit: 'ready', job: { id: begun.data.training.id, status: 'failed', detail: 'late' } });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        expect((await list()).trainings.find((one) => one.id === done.id).status).toBe('done');
+
+        // Stopping tells the app, and a stopped run can be taken off the list.
+        const second = (await start({ name: 'second-try' })).data.training;
+        const stopped = await client.post(`/api/v1/trainings/${second.id}/stop`, {});
+        expect(stopped.data.training).toMatchObject({ status: 'stopped', detail: 'Stopped before it finished. Nothing was added to the computer\'s models.' });
+        await until(() => orders.find((one) => one.action === 'stop' && one.id === second.id));
+        expect((await client.delete(`/api/v1/trainings/${second.id}`)).status).toBe(200);
+        expect((await list()).trainings.map((one) => one.name)).toEqual(['kind-helper']);
+
+        // Another person sees none of it and can touch none of it.
+        await testStartup.loginAsUser('user');
+        expect((await list()).trainings).toEqual([]);
+        expect((await client.post(`/api/v1/trainings/${done.id}/stop`, {}, { validateStatus: () => true })).status).toBe(404);
+        expect((await start()).status).toBe(404);
     });
 
     test('a person sees which of their linked computers can pool, read from what each desktop app reports when it connects', async () => {
