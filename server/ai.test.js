@@ -4,6 +4,17 @@ import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
 import { describe, test, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import TestStartup from '../utils/test.startup.js';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import mongoose from 'mongoose';
+import { Server } from '../../server/server.js';
+import { Rental } from '../../server/models/ai.model.js';
+import { setHyperstackFetch } from '../../server/middleware/ai.middleware.js';
+import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
+import { rentalsOn, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
@@ -109,8 +120,8 @@ describe('Ollama error mapping', () => {
     });
 
     test('every code has a plain message that hides the raw error', () => {
-        // These details are written by Mollama itself and are shown: why a pool did not start, and how much memory a model needs.
-        for (const code of ERROR_CODES.filter((one) => !['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY'].includes(one))) {
+        // These details are written by Mollama itself and are shown: why a pool did not start, how much memory a model needs, why a rental ended.
+        for (const code of ERROR_CODES.filter((one) => !['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY', 'RENTAL_ENDED'].includes(one))) {
             const error = new OllamaError(code, 'raw internal text');
             expect(error.toJSON()).toEqual({ code, message: error.message, action: error.action });
             expect(JSON.stringify(error.toJSON())).not.toContain('raw internal text');
@@ -8503,6 +8514,565 @@ describe('Linked devices', () => {
         } finally {
             process.env.LOCAL_DEVICE = 'true';
         }
+    });
+
+    // Stage 5G. Hyperstack and Stripe are stand-ins here: no machine is rented and no request leaves this computer.
+    describe('Rented computers', () => {
+        const SETTINGS = { HYPERSTACK_API_KEY: 'hs_test_standin', HYPERSTACK_ENVIRONMENT: 'mollama-test', HYPERSTACK_KEY_NAME: 'mollama-key', RENTAL_SERVER_URL: 'https://server.mollama.test', RENTAL_LABEL: 'Test' };
+        const L40_PRICE = 131;
+        const hs = { machines: new Map(), calls: [], next: 7000, credit: 50, canCreate: true, refuseDelete: false, failCreate: null, down: false, bills: new Map() };
+        const answer = (body, status = 200) => Response.json(body, { status });
+        const flavor = (name, gpu, extra = {}) => ({ name, gpu, gpu_count: 1, cpu: 28, ram: 58, disk: 100, region_name: 'CANADA-1', stock_available: true, ...extra });
+        const standIn = async (url, options = {}) => {
+            const { pathname, searchParams } = new URL(url);
+            const path = pathname.replace('/v1', '');
+            const method = options.method || 'GET';
+            hs.calls.push({ method, path, key: options.headers?.api_key, body: options.body ? JSON.parse(options.body) : null });
+            if (hs.down) throw new Error('fetch failed');
+            const one = path.match(/^\/core\/virtual-machines\/(\d+)$/);
+            const bill = path.match(/^\/billing\/billing\/history\/virtual-machine\/(\d+)$/);
+            if (path === '/core/environments') return answer({ status: true, environments: [{ name: 'someone-else', region: 'NORWAY-1' }, { name: SETTINGS.HYPERSTACK_ENVIRONMENT, region: 'CANADA-1' }] });
+            if (path === '/core/flavors') {
+                return answer({ status: true, data: [
+                    { gpu: 'L40', region_name: 'CANADA-1', flavors: [flavor('n3-L40x1', 'L40'), flavor('n3-L40x1-spot', 'L40'), flavor('n3-L40x2', 'L40', { gpu_count: 2, stock_available: false })] },
+                    { gpu: 'H100-80G-PCIe', region_name: 'CANADA-1', flavors: [flavor('n3-H100x1', 'H100-80G-PCIe')] },
+                    { gpu: 'A100-80G-PCIe', region_name: 'NORWAY-1', flavors: [flavor('n3-A100x1', 'A100-80G-PCIe', { region_name: 'NORWAY-1' })] },
+                    { gpu: '', region_name: 'CANADA-1', flavors: [flavor('n1-cpu-small', '', { gpu_count: 0 })] }
+                ] });
+            }
+            if (path === '/pricebook') return answer([{ name: 'L40', value: '1.000000000' }, { name: 'H100-80G-PCIe', value: '2.500000000' }, { name: 'A100-80G-PCIe', value: '1.350000000' }, { name: 'PublicIP', value: '0.006720000' }]);
+            if (path === '/billing/user-credit/credit') return answer({ status: true, data: { credit: hs.credit, threshold: 0, can_create_instance: hs.canCreate } });
+            if (path === '/core/virtual-machines' && method === 'POST') {
+                if (hs.failCreate) return answer({ status: false, message: hs.failCreate, error_reason: 'bad_request' }, 400);
+                const id = hs.next += 1;
+                const body = JSON.parse(options.body);
+                hs.machines.set(id, { id, name: body.name, status: 'CREATING', labels: body.labels, created_at: new Date().toISOString(), body });
+                return answer({ status: true, message: 'VM is scheduled for creation.', instances: [{ id, name: body.name, status: 'CREATING' }] });
+            }
+            if (path === '/core/virtual-machines') {
+                const search = searchParams.get('search') || '';
+                return answer({ status: true, instances: [...hs.machines.values()].filter((machine) => machine.name.includes(search)).map(({ body, ...machine }) => machine) });
+            }
+            if (one && method === 'DELETE') {
+                const machine = hs.machines.get(Number(one[1]));
+                if (!machine) return answer({ status: false, message: 'VM does not exist.', error_reason: 'not_found' }, 404);
+                if (hs.refuseDelete) return answer({ status: false, message: 'The VM is still being created.', error_reason: 'bad_request' }, 400);
+                machine.status = 'DELETING';
+                return answer({ status: true, message: 'Instance is being deleted.' });
+            }
+            if (one) {
+                const machine = hs.machines.get(Number(one[1]));
+                if (!machine) return answer({ status: false, message: `VM ${one[1]} does not exist.`, error_reason: 'not_found' }, 404);
+                if (machine.status === 'DELETING') {
+                    hs.machines.delete(machine.id);
+                    return answer({ status: false, message: `VM ${one[1]} does not exist.`, error_reason: 'not_found' }, 404);
+                }
+                return answer({ status: true, instance: { id: machine.id, name: machine.name, status: machine.status } });
+            }
+            if (bill) return hs.bills.has(Number(bill[1])) ? answer({ status: true, billing_history_vm_details: { billing_history: [{ metrics: { incurred_bill: hs.bills.get(Number(bill[1])) } }] } }) : answer({ status: false }, 500);
+            return answer({ status: false, message: 'Unknown path' }, 404);
+        };
+
+        const kept = {};
+        const any = { validateStatus: () => true };
+        const credit = async (userId, cents) => {
+            const { balance } = await balanceOf(userId);
+            if (balance < cents) await addCredit(userId, cents - balance, { about: 'For a rental test' });
+            else if (balance > cents) await charge(userId, balance - cents, { about: 'For a rental test' });
+        };
+        const linkIn = (machine) => JSON.parse(machine.body.user_data.match(/<<'MOLLAMA_LINK'\n(.*)\n/)[1]);
+        const made = () => [...hs.machines.values()].at(-1);
+        const back = (minutes) => new Date(Date.now() - minutes * 60000);
+        const aged = (id, minutes) => Rental.collection.updateOne({ _id: new mongoose.Types.ObjectId(String(id)) }, { $set: { createdAt: back(minutes) } });
+        // Ends whatever is open, so each test starts with no rental and no machine.
+        const clear = async () => {
+            Object.assign(hs, { refuseDelete: false, failCreate: null, down: false, credit: 50, canCreate: true });
+            for (const rental of await Rental.find({ state: { $ne: 'ended' } })) {
+                await settle(rental.user, `rental:${rental.id}`, 0, 'Cleared between tests').catch(() => {});
+                await Rental.updateOne({ _id: rental._id }, { $set: { state: 'ended', endedAt: new Date() }, $unset: { slot: 1 } });
+            }
+            await Device.deleteMany({ rental: { $ne: null } });
+            hs.machines.clear();
+            hs.calls.length = 0;
+        };
+        const rent = async (who = 'admin', body = { flavor: 'n3-L40x1' }, cents = 2000) => {
+            await testStartup.loginAsUser(who);
+            await credit(testStartup[who].id, cents);
+            return client.post('/api/v1/rentals', body, any);
+        };
+        const linked = async (rental) => {
+            const { deviceId, key } = linkIn(made());
+            made().status = 'ACTIVE';
+            const app = await workingApp(deviceId, key);
+            await expect.poll(async () => (await Rental.findById(rental.id)).state, { timeout: 5000 }).toBe('running');
+            return app;
+        };
+
+        beforeAll(() => {
+            for (const name of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', ...Object.keys(SETTINGS)]) kept[name] = process.env[name];
+            process.env.STRIPE_SECRET_KEY ||= 'sk_test_standin';
+            process.env.STRIPE_WEBHOOK_SECRET ||= 'whsec_standin';
+            Object.assign(process.env, SETTINGS);
+            setHyperstackFetch(standIn);
+        });
+        afterAll(async () => {
+            await clear();
+            setHyperstackFetch(null);
+            for (const [name, value] of Object.entries(kept)) {
+                if (value === undefined) delete process.env[name];
+                else process.env[name] = value;
+            }
+        });
+        beforeEach(clear);
+
+        test('renting is off, and says nothing, until Hyperstack and billing are both set up', async () => {
+            await testStartup.loginAsUser('admin');
+            const key = process.env.HYPERSTACK_API_KEY;
+            delete process.env.HYPERSTACK_API_KEY;
+            try {
+                expect(rentalsOn()).toBe(false);
+                expect((await client.get('/api/v1/rentals/cards')).data).toEqual({ success: true, on: false });
+                expect((await client.get('/api/v1/rentals')).data).toEqual({ success: true, on: false, rentals: [] });
+                expect((await client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)).status).toBe(404);
+                expect(await watchRentals()).toBeNull();
+                expect(() => Server.prototype.validateEnvironment.call({})).toThrow(/Rented computers need all of/);
+            } finally {
+                process.env.HYPERSTACK_API_KEY = key;
+            }
+            const stripe = process.env.STRIPE_SECRET_KEY;
+            delete process.env.STRIPE_SECRET_KEY;
+            try {
+                expect(rentalsOn()).toBe(false);
+            } finally {
+                process.env.STRIPE_SECRET_KEY = stripe;
+            }
+            expect(rentalsOn()).toBe(true);
+            expect(() => Server.prototype.validateEnvironment.call({})).not.toThrow();
+            expect(hs.calls).toEqual([]);
+        });
+
+        test('the cards are the ones in stock where Mollama\'s machines live, at Hyperstack\'s price plus the markup', async () => {
+            await testStartup.loginAsUser('admin');
+            await credit(testStartup.admin.id, 2000);
+            const response = await client.get('/api/v1/rentals/cards');
+            expect(response.data).toMatchObject({ on: true, balance: 2000, rules: { limit: 1000, hours: 2, idleMinutes: 30, atOnce: 1 } });
+            expect(response.data.cards.map((card) => card.flavor)).toEqual(['n3-L40x1', 'n3-H100x1']);
+            // $1.00 and a public address at $0.00672, plus 30%, rounded up to a cent.
+            expect(response.data.cards[0]).toMatchObject({ name: 'L40', memoryMb: 48 * 1024, price: L40_PRICE });
+            expect(response.data.cards[1]).toMatchObject({ memoryMb: 80 * 1024, price: rentalPrice(250.672) });
+            expect(JSON.stringify(response.data)).not.toMatch(/cost|hs_test_standin/);
+            expect(hs.calls.every((call) => call.key === SETTINGS.HYPERSTACK_API_KEY)).toBe(true);
+        });
+
+        test('no credit, no machine; and the limit must cover one hour', async () => {
+            const none = await rent('admin', { flavor: 'n3-L40x1' }, 500);
+            expect(none.status).toBe(402);
+            expect(none.data).toMatchObject({ code: 'NOT_ENOUGH_CREDIT', balance: 500, limit: 1000 });
+            const small = await rent('admin', { flavor: 'n3-L40x1', limit: 130 }, 2000);
+            expect(small.status).toBe(400);
+            expect(small.data).toMatchObject({ code: 'LIMIT_TOO_SMALL', least: L40_PRICE });
+            expect((await rent('admin', { flavor: 'n3-L40x1-spot' })).data.code).toBe('CARD_GONE');
+            expect((await rent('admin', { flavor: 'n3-L40x2' })).data.code).toBe('CARD_GONE');
+            expect((await client.post('/api/v1/rentals', {}, any)).status).toBe(400);
+            expect(hs.machines.size).toBe(0);
+            expect(await Rental.countDocuments({ state: { $ne: 'ended' } })).toBe(0);
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000, held: 0 });
+        });
+
+        test('renting sets the whole limit aside and starts a machine that holds only its own link', async () => {
+            const response = await rent();
+            expect(response.status).toBe(201);
+            expect(response.data.rental).toMatchObject({ state: 'starting', price: L40_PRICE, limit: 1000, minutes: 120, idleMinutes: 30, spent: 0, card: { name: 'L40' } });
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1000, held: 1000 });
+
+            const machine = made();
+            expect(machine.name).toBe(`mollama-test-${response.data.rental.id}`);
+            expect(machine.body).toMatchObject({ flavor_name: 'n3-L40x1', environment_name: 'mollama-test', key_name: 'mollama-key', count: 1, labels: ['mollama', 'mollama-test'] });
+            expect(machine.body.security_rules).toBeUndefined();
+            const script = machine.body.user_data;
+            expect(Buffer.from(script).toString('base64').length).toBeLessThan(65535);
+            expect(linkIn(machine)).toEqual({ socket: 'wss://server.mollama.test/devices', deviceId: response.data.rental.device, key: expect.stringMatching(/^[0-9a-f]{64}$/) });
+            expect(script).toContain('sha256sum -c');
+            expect(script).toContain('answerRequest');
+            expect(script).not.toMatch(/hs_test_standin|sk_test|whsec|MONGODB|TOKEN_SECRET/);
+
+            const device = await Device.findById(response.data.rental.device).select('+keyHash');
+            expect(device.toObject()).toMatchObject({ kind: 'companion', name: 'Rented L40' });
+            expect(String(device.registeredBy)).toBe(testStartup.admin.id);
+            expect(device.keyHash).not.toBe(linkIn(machine).key);
+            const listed = (await client.get('/api/v1/devices')).data.devices.find((one) => one.id === device.id);
+            expect(listed).toMatchObject({ online: false, rental: response.data.rental.id });
+        });
+
+        test('one machine at a time, also when asked for twice at the same moment', async () => {
+            await credit(testStartup.admin.id, 5000);
+            await testStartup.loginAsUser('admin');
+            const both = await Promise.all([client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any), client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)]);
+            expect(both.map((response) => response.status).sort()).toEqual([201, 409]);
+            const third = await client.post('/api/v1/rentals', { flavor: 'n3-H100x1' }, any);
+            expect(third.status).toBe(409);
+            expect(third.data.code).toBe('ALREADY_RENTING');
+            expect(hs.machines.size).toBe(1);
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 4000, held: 1000 });
+        });
+
+        test('a rented computer is its person\'s alone, and is never part of a pool', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            expect((await client.put(`/api/v1/devices/${rental.device}/pool`, { role: 'lend' })).data.code).toBe('RENTED_NOT_POOLED');
+            expect((await client.put(`/api/v1/devices/${rental.device}/pool`, { role: 'main' })).status).toBe(400);
+            const pools = (await client.get('/api/v1/devices/pools')).data;
+            expect(JSON.stringify(pools)).not.toContain(rental.device);
+
+            await testStartup.loginAsUser('creator');
+            expect((await client.get('/api/v1/rentals')).data.rentals).toEqual([]);
+            expect((await client.get('/api/v1/devices')).data.devices.some((one) => one.id === rental.device)).toBe(false);
+            expect((await client.get(`/api/v1/devices/${rental.device}`)).status).toBe(404);
+            expect((await client.post(`/api/v1/rentals/${rental.id}/end`, {}, any)).status).toBe(404);
+            expect((await Rental.findById(rental.id)).state).toBe('running');
+        });
+
+        test('the machine becomes one of the person\'s computers when its program connects, and the person is told', async () => {
+            const { rental } = (await rent()).data;
+            expect((await watchRentals()).ended).toBe(0);
+            expect((await Rental.findById(rental.id)).readyAt).toBeNull();
+            await linked(rental);
+            const now = await Rental.findById(rental.id);
+            expect(now.readyAt).toBeInstanceOf(Date);
+            expect(now.linkedAt).toBeInstanceOf(Date);
+            const device = (await client.get(`/api/v1/devices/${rental.device}`)).data.device;
+            expect(device).toMatchObject({ online: true, rental: rental.id, ollama: { available: true } });
+            await expect.poll(async () => (await client.get('/api/v1/notifications')).data.notifications.some((entry) => entry.type === 'rental:ready'), { timeout: 5000 }).toBe(true);
+        });
+
+        test('the machine\'s own program links, reports its hardware and passes requests to its Ollama', async () => {
+            const { rental } = (await rent()).data;
+            made().status = 'ACTIVE';
+            const asked = [];
+            const ollama = http.createServer((req, res) => {
+                asked.push(`${req.method} ${req.url}`);
+                res.setHeader('content-type', 'application/json');
+                if (req.url === '/api/version') return res.end(JSON.stringify({ version: '0.99.0' }));
+                if (req.url === '/api/tags') return res.end(JSON.stringify(TAGS));
+                if (req.url === '/api/ps') return res.end(JSON.stringify({ models: [] }));
+                res.statusCode = 404;
+                return res.end('{"error":"not found"}');
+            });
+            await new Promise((resolve) => ollama.listen(0, '127.0.0.1', resolve));
+            const linkFile = path.join(os.tmpdir(), `mollama-link-${rental.id}.json`);
+            fs.writeFileSync(linkFile, JSON.stringify({ ...linkIn(made()), socket: `ws://localhost:${testStartup.port}/devices` }));
+            const program = spawn(process.execPath, [fileURLToPath(new URL('../../server/templates/rented.computer.js', import.meta.url))], {
+                env: { ...process.env, MOLLAMA_LINK: linkFile, OLLAMA_HOST: `http://127.0.0.1:${ollama.address().port}` }, stdio: 'ignore'
+            });
+            try {
+                await expect.poll(async () => (await Rental.findById(rental.id)).state, { timeout: 15000 }).toBe('running');
+                await expect.poll(async () => (await Device.findById(rental.device)).hardware?.cpuThreads, { timeout: 10000 }).toBeGreaterThan(0);
+                const device = (await client.get(`/api/v1/devices/${rental.device}`)).data.device;
+                expect(device).toMatchObject({ online: true, ollama: { available: true, version: '0.99.0' } });
+                expect((await Device.findById(rental.device)).hardware.network).toBeUndefined();
+                const models = await client.client.get('/api/v1/models', through(rental.device));
+                expect(models.data.models.map((model) => model.name)).toContain('tiny:1b');
+                expect(asked).toContain('GET /api/tags');
+
+                // Ended: the server lets the computer go and its program stops by itself.
+                const gone = new Promise((resolve) => program.once('exit', resolve));
+                await client.post(`/api/v1/rentals/${rental.id}/end`, {});
+                await watchRentals();
+                expect(await gone).toBe(0);
+            } finally {
+                program.kill();
+                ollama.close();
+                fs.rmSync(linkFile, { force: true });
+            }
+        }, 60000);
+
+        test('ending it charges the minutes used, gives the rest back, and shows it ended only once the machine is gone', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(10.5) });
+            expect(rentalSpent(await Rental.findById(rental.id))).toBe(Math.ceil(11 * L40_PRICE / 60));
+
+            const ending = await client.post(`/api/v1/rentals/${rental.id}/end`, {});
+            expect(ending.data.rental).toMatchObject({ state: 'ending', reason: 'asked', spent: 25 });
+            expect(made().status).toBe('DELETING');
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1000, held: 1000 });
+            expect(await Device.exists({ _id: rental.device })).toBeTruthy();
+
+            expect(await watchRentals()).toMatchObject({ seen: 1, ended: 1 });
+            const ended = (await client.get('/api/v1/rentals')).data.rentals[0];
+            expect(ended).toMatchObject({ id: rental.id, state: 'ended', reason: 'asked', spent: 25, why: 'you ended it' });
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1975, held: 0 });
+            expect(hs.machines.size).toBe(0);
+            expect(await Device.exists({ _id: rental.device })).toBeNull();
+            const line = (await client.get('/api/v1/billing/lines?limit=1')).data.lines[0];
+            expect(line).toMatchObject({ kind: 'charge', change: -25, balance: 1975, heldTotal: 0 });
+
+            // Ending again, or another pass, changes nothing.
+            await client.post(`/api/v1/rentals/${rental.id}/end`, {});
+            await watchRentals();
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1975, held: 0 });
+        });
+
+        test('removing the rented computer from the Devices page ends the rental too', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            expect((await client.delete(`/api/v1/devices/${rental.device}`)).status).toBe(200);
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason: 'asked' });
+            expect(made().status).toBe('DELETING');
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).state).toBe('ended');
+            expect((await balanceOf(testStartup.admin.id)).held).toBe(0);
+        });
+
+        test('it ends at its time limit, at its spending limit, and after half an hour with nothing running', async () => {
+            const ends = [
+                [{ flavor: 'n3-L40x1', hours: 1 }, { readyAt: back(60.5) }, 'time', Math.ceil(61 * L40_PRICE / 60)],
+                [{ flavor: 'n3-L40x1', hours: 12, limit: 200 }, { readyAt: back(95) }, 'limit', 200],
+                [{ flavor: 'n3-L40x1' }, { readyAt: back(39.5), activeAt: back(31) }, 'idle', Math.ceil(40 * L40_PRICE / 60)]
+            ];
+            for (const [body, clock, reason, spent] of ends) {
+                await clear();
+                const { rental } = (await rent('admin', body)).data;
+                await linked(rental);
+                expect((await watchRentals()).ended).toBe(0);
+                await Rental.updateOne({ _id: rental.id }, clock);
+                await watchRentals();
+                expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason, spent });
+                expect(made().status).toBe('DELETING');
+                await watchRentals();
+                expect((await Rental.findById(rental.id)).state).toBe('ended');
+                expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000 - spent, held: 0 });
+            }
+        });
+
+        test('something running keeps it from being ended as idle, and a warning comes five minutes before any end', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(50), activeAt: back(45) });
+            await Download.create({ model: 'tiny:1b', status: 'downloading', requestedBy: testStartup.admin.id, device: rental.device });
+            await watchRentals();
+            const busy = await Rental.findById(rental.id);
+            expect(busy.state).toBe('running');
+            expect(Date.now() - busy.activeAt).toBeLessThan(5000);
+            await Download.deleteMany({ device: rental.device });
+
+            await Rental.updateOne({ _id: rental.id }, { activeAt: back(26) });
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).warned).toEqual(['idle']);
+            await watchRentals();
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(116), activeAt: new Date() });
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'running', warned: ['idle', 'time'] });
+            await expect.poll(async () => (await client.get('/api/v1/notifications')).data.notifications.filter((entry) => entry.type === 'rental:ending').length, { timeout: 5000 }).toBe(2);
+        });
+
+        test('a reply being written when the limit is reached ends with a plain reason, and the machine is deleted', async () => {
+            const { rental } = (await rent()).data;
+            const line = (value) => Buffer.from(`${JSON.stringify(value)}\n`).toString('base64');
+            let asked = null;
+            const holdChat = (message, app) => {
+                asked = message.id;
+                app.ws.send(JSON.stringify({ id: asked, n: 1, type: 'head', status: 200, headers: { 'content-type': 'application/x-ndjson' } }));
+                app.ws.send(JSON.stringify({ id: asked, n: 2, type: 'chunk', data: line({ model: 'tiny:1b', message: { role: 'assistant', content: 'Half an ' }, done: false }) }));
+            };
+            const { deviceId, key } = linkIn(made());
+            made().status = 'ACTIVE';
+            const app = await workingApp(deviceId, key, { holdChat });
+            await expect.poll(async () => (await Rental.findById(rental.id)).state, { timeout: 5000 }).toBe('running');
+            const chat = (await client.post('/api/v1/chats', { device: rental.device, model: 'tiny:1b' })).data.chat;
+            const pending = client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'count' }, { responseType: 'text', transformResponse: [(data) => data] });
+            await expect.poll(() => asked, { timeout: 10000 }).not.toBeNull();
+
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(600) });
+            await watchRentals();
+            const events = String((await pending).data).split('\n').filter(Boolean).map((one) => JSON.parse(one));
+            const last = events.at(-1);
+            expect(last).toMatchObject({ type: 'error', code: 'RENTAL_ENDED', detail: 'It ended because it reached its spending limit.', reply: { content: 'Half an ' } });
+            expect(last.message).toMatch(/rented computer was ended/);
+            expect(app.cancelled).toContain(asked);
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason: 'limit', spent: 1000 });
+            expect(made().status).toBe('DELETING');
+            await watchRentals();
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1000, held: 0 });
+        });
+
+        test('when Hyperstack refuses the delete, the rental is not shown as ended and the delete is tried again', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(29.5) });
+            hs.refuseDelete = true;
+            await client.post(`/api/v1/rentals/${rental.id}/end`, {});
+            for (let pass = 0; pass < 3; pass += 1) expect((await watchRentals()).ended).toBe(0);
+            const stuck = await Rental.findById(rental.id);
+            expect(stuck).toMatchObject({ state: 'ending', spent: Math.ceil(30 * L40_PRICE / 60) });
+            expect(stuck.deleteTries).toBe(4);
+            expect(made().status).toBe('ACTIVE');
+            expect((await balanceOf(testStartup.admin.id)).held).toBe(1000);
+            expect((await client.get('/api/v1/rentals')).data.rentals[0].state).toBe('ending');
+            expect(hs.calls.filter((call) => call.method === 'DELETE')).toHaveLength(4);
+
+            // The charge was fixed when the end was asked for, however long Hyperstack then takes.
+            await Rental.updateOne({ _id: rental.id }, { endingAt: back(50) });
+            hs.down = true;
+            expect((await watchRentals()).ended).toBe(0);
+            hs.down = false;
+            hs.refuseDelete = false;
+            await watchRentals();
+            expect((await watchRentals()).ended).toBe(1);
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000 - Math.ceil(30 * L40_PRICE / 60), held: 0 });
+        });
+
+        test('a machine that never becomes usable is ended after twenty minutes and costs its person nothing', async () => {
+            const { rental } = (await rent()).data;
+            made().status = 'ACTIVE';
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).readyAt).toBeInstanceOf(Date);
+            await aged(rental.id, 21);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(19) });
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason: 'failed', spent: 0 });
+            await watchRentals();
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000, held: 0 });
+            expect(hs.machines.size).toBe(0);
+        });
+
+        test('a machine that Hyperstack could not start, or that stopped there, is ended and nothing is lost', async () => {
+            hs.failCreate = 'Not enough capacity for this flavor.';
+            const refused = await rent();
+            expect(refused.status).toBe(502);
+            expect(refused.data.code).toBe('RENT_FAILED');
+            const failed = await Rental.findOne({ user: testStartup.admin.id }).sort({ createdAt: -1 });
+            expect(failed).toMatchObject({ state: 'ending', reason: 'failed', spent: 0 });
+            // Nothing comes back until it is sure no machine was made: a start may land after its answer was lost.
+            expect((await balanceOf(testStartup.admin.id)).held).toBe(1000);
+            await aged(failed._id, 4);
+            await watchRentals();
+            expect((await Rental.findById(failed._id)).state).toBe('ended');
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000, held: 0 });
+            expect(await Device.exists({ rental: failed._id })).toBeNull();
+
+            hs.failCreate = null;
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(11.5) });
+            hs.machines.delete(made().id);
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ended', reason: 'gone', spent: Math.ceil(12 * L40_PRICE / 60) });
+        });
+
+        test('the limits hold on this server\'s own clock while Hyperstack cannot be asked', async () => {
+            const { rental } = (await rent('admin', { flavor: 'n3-L40x1', hours: 1 })).data;
+            await linked(rental);
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(70) });
+            hs.down = true;
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason: 'time' });
+            expect((await balanceOf(testStartup.admin.id)).held).toBe(1000);
+            hs.down = false;
+            await watchRentals();
+            await watchRentals();
+            expect((await Rental.findById(rental.id)).state).toBe('ended');
+            expect(hs.machines.size).toBe(0);
+        });
+
+        test('with the server off, the separate check still ends a machine on time and gives the credit back', async () => {
+            const { rental } = (await rent('admin', { flavor: 'n3-L40x1', hours: 1 })).data;
+            const app = await linked(rental);
+            app.ws.close();
+            await app.closed;
+            // Nothing refreshes the rental while the server is down; the check works from what was written down.
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(19.5), activeAt: back(20) });
+            expect(await watchRentals({ alone: true })).toMatchObject({ seen: 1, ended: 0 });
+            await Rental.updateOne({ _id: rental.id }, { activeAt: back(31) });
+            await watchRentals({ alone: true });
+            expect((await Rental.findById(rental.id)).toObject()).toMatchObject({ state: 'ending', reason: 'idle' });
+            expect((await watchRentals({ alone: true })).ended).toBe(1);
+            expect(hs.machines.size).toBe(0);
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000 - Math.ceil(20 * L40_PRICE / 60), held: 0 });
+
+            await clear();
+            const never = (await rent()).data.rental;
+            await aged(never.id, 25);
+            await watchRentals({ alone: true });
+            await watchRentals({ alone: true });
+            expect((await Rental.findById(never.id)).toObject()).toMatchObject({ state: 'ended', reason: 'failed', spent: 0 });
+        });
+
+        test('the sweep deletes a machine with Mollama\'s mark that no rental knows, and leaves every other machine alone', async () => {
+            const { rental } = (await rent()).data;
+            const known = made();
+            const add = (id, name, status = 'ACTIVE') => hs.machines.set(id, { id, name, status, created_at: new Date().toISOString() });
+            add(9001, `mollama-test-${new mongoose.Types.ObjectId()}`);
+            add(9002, 'mollama-test-by-hand');
+            add(9003, `mollama-staging-${new mongoose.Types.ObjectId()}`);
+            add(9004, 'somebody-elses-machine');
+            add(9005, `mollama-test-${new mongoose.Types.ObjectId()}`, 'DELETING');
+            const old = await Rental.create({ user: testStartup.admin.id, price: 131, cost: 100, limit: 1000, minutes: 120, idleMinutes: 30, state: 'ended', card: { flavor: 'n3-L40x1', gpu: 'L40' }, machine: { name: 'pending' } });
+            add(9006, `mollama-test-${old.id}`);
+
+            expect(await sweepRentals()).toBe(3);
+            expect(hs.machines.get(9001).status).toBe('DELETING');
+            expect(hs.machines.get(9002).status).toBe('DELETING');
+            expect(hs.machines.get(9006).status).toBe('DELETING');
+            expect(hs.machines.get(9003).status).toBe('ACTIVE');
+            expect(hs.machines.get(9004).status).toBe('ACTIVE');
+            expect(known.status).toBe('CREATING');
+            expect(hs.calls.filter((call) => call.method === 'DELETE').map((call) => call.path).sort()).toEqual(['/core/virtual-machines/9001', '/core/virtual-machines/9002', '/core/virtual-machines/9006']);
+
+            // A machine whose start was never answered is found by its name and taken into its rental.
+            await Rental.updateOne({ _id: rental.id }, { 'machine.id': null });
+            await sweepRentals();
+            expect((await Rental.findById(rental.id)).machine.id).toBe(known.id);
+        });
+
+        test('a rental is refused while Mollama\'s own balance at Hyperstack cannot cover it, and the owner is told', async () => {
+            // Two hours of an L40 cost Mollama about $2.01, and $2 is always kept spare.
+            hs.credit = 4;
+            const low = await rent();
+            expect(low.status).toBe(503);
+            expect(low.data.code).toBe('RENTALS_PAUSED');
+            expect(hs.machines.size).toBe(0);
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000, held: 0 });
+
+            hs.credit = 50;
+            hs.canCreate = false;
+            expect((await rent()).status).toBe(503);
+            hs.canCreate = true;
+
+            // What an open rental may still cost is counted before another person's is allowed.
+            hs.credit = 6;
+            expect((await rent()).status).toBe(201);
+            expect((await rent('creator')).status).toBe(503);
+            hs.credit = 6.3;
+            expect((await rent('creator')).status).toBe(201);
+
+            await testStartup.loginAsUser('owner');
+            await expect.poll(async () => (await client.get('/api/v1/notifications')).data.notifications.some((entry) => entry.type === 'rental:funds'), { timeout: 5000 }).toBe(true);
+        });
+
+        test('what customers used is compared with Hyperstack\'s bill, for administrators only', async () => {
+            const day = new Date(Date.now() - 24 * 60 * 60000).toISOString().slice(0, 10);
+            const noon = new Date(`${day}T12:00:00Z`);
+            const base = { user: testStartup.admin.id, price: 131, cost: 100.672, limit: 1000, minutes: 120, idleMinutes: 30, state: 'ended', card: { flavor: 'n3-L40x1', gpu: 'L40' } };
+            await Rental.deleteMany({});
+            await Rental.create({ ...base, machine: { id: 8101, name: 'mollama-test-a' }, readyAt: noon, linkedAt: noon, endedAt: new Date(noon.getTime() + 60 * 60000), spent: 131 });
+            await Rental.create({ ...base, machine: { id: 8102, name: 'mollama-test-b' }, readyAt: new Date(noon.getTime() - 30 * 60000), linkedAt: noon, endedAt: new Date(noon.getTime() + 30 * 60000), spent: 131 });
+            hs.bills.set(8101, 1.01);
+            hs.bills.set(8102, 1.0);
+            expect(await compareRentals(day)).toMatchObject({ day, rentals: 2, expected: 201, billed: 201, charged: 262, unknown: 0, difference: 0, matches: true });
+
+            hs.bills.set(8102, 9.5);
+            expect(await compareRentals(day)).toMatchObject({ billed: 1051, difference: 850, matches: false });
+            hs.bills.delete(8102);
+            expect(await compareRentals(day)).toMatchObject({ unknown: 1, matches: false });
+
+            await testStartup.loginAsUser('admin');
+            expect((await client.get(`/api/v1/rentals/compare?day=${day}`)).data).toMatchObject({ success: true, day, rentals: 2 });
+            expect((await client.get('/api/v1/rentals/compare?day=yesterday')).status).toBe(400);
+            await testStartup.loginAsUser('creator');
+            expect((await client.get(`/api/v1/rentals/compare?day=${day}`)).status).toBe(403);
+            await Rental.deleteMany({ 'machine.id': { $in: [8101, 8102] } });
+        });
     });
 });
 
