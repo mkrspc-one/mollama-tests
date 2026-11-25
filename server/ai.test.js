@@ -16,7 +16,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7099,14 +7099,92 @@ describe('Linked devices', () => {
         expect(readLessons('Q: one?\nA: yes').problem).toBe('There is 1 lesson here. Training needs at least 20: fewer teach nothing that lasts.');
         expect(readLessons('x'.repeat(1000001)).problem).toMatch(/^The lessons are too long/);
         // About the same number of updates whatever the size, and rows as long as the longest lesson.
-        expect(trainSettings(jsonl.lessons, 'habits')).toEqual({ epochs: 15, lr: 0.0002, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' });
+        expect(trainSettings(jsonl.lessons, 'habits')).toMatchObject({ epochs: 15, lr: 0.0002, batch: 8, maxLength: 256, r: 64, alpha: 64, quantization: '4bit' });
         const many = Array.from({ length: 800 }, (_, at) => [{ role: 'user', content: `Question ${at} ${'word '.repeat(150)}` }, { role: 'assistant', content: 'An answer.' }]);
-        expect(trainSettings(many, 'facts')).toEqual({ epochs: 3, lr: 0.0002, batch: 4, maxLength: 512, r: 256, alpha: 256, quantization: 'none' });
+        expect(trainSettings(many, 'facts')).toMatchObject({ epochs: 3, lr: 0.0002, batch: 4, maxLength: 512, r: 256, alpha: 256, quantization: 'none' });
         expect(TRAIN_BASES.every((base) => /^[\w.-]+\/[\w.-]+$/.test(base.source))).toBe(true);
-        // What a run takes grows with the model: the smallest is what was measured, facts take more than habits.
-        expect(trainNeeds(494032768, 'habits')).toEqual({ gpuMb: 2800, memoryMb: 3482, downloadMb: 1088 });
-        expect(trainNeeds(494032768, 'facts').gpuMb).toBe(3500);
-        expect([trainNeeds(7615616512, 'habits').gpuMb, trainNeeds(7615616512, 'facts').gpuMb, trainNeeds(32763876352, 'habits').gpuMb]).toEqual([6202, 19154, 23052]);
+        // What a run takes grows with the model, by the trainer's own estimate of the usual run.
+        expect(trainNeeds(494032768, 'habits')).toEqual({ gpuMb: 3709, memoryMb: 3482, downloadMb: 1088 });
+        expect(trainNeeds(494032768, 'facts').gpuMb).toBe(3707);
+        expect([trainNeeds(7615616512, 'habits').gpuMb, trainNeeds(7615616512, 'facts').gpuMb, trainNeeds(32763876352, 'habits').gpuMb]).toEqual([13961, 23884, 42746]);
+    });
+
+    test('every setting of a run is named, explained and checked, and a run is worked out from what a person set, their lessons and the card', () => {
+        // Each setting belongs to a group, says what it does in plain words, and has limits or choices.
+        expect(TRAIN_GROUPS.map((group) => group.id)).toEqual(['adapter', 'precision', 'pace', 'lessons', 'care', 'result']);
+        expect(TRAIN_SETTINGS.every((one) => TRAIN_GROUPS.some((group) => group.id === one.group) && one.label && one.about.length > 40
+            && (one.type === 'switch' || (one.type === 'choice' && one.options.length >= 2) || (one.type === 'number' && one.min < one.max)))).toBe(true);
+        expect(new Set(TRAIN_SETTINGS.map((one) => one.id)).size).toBe(TRAIN_SETTINGS.length);
+        // Nothing of the trainer's own wording reaches the page, and what it marks as not working is not offered.
+        expect(JSON.stringify(TRAIN_SETTINGS)).not.toMatch(/lora_|target_modules|gradient_|use_dora|early_stop|forgetting_/);
+
+        // A run with nothing changed has a value for every setting, and they pass their own check.
+        const usual = trainSettings({ count: 24, longest: 40 }, 'habits');
+        expect(Object.keys(usual).sort()).toEqual(TRAIN_SETTINGS.map((one) => one.id).sort());
+        expect(usual).toMatchObject({ r: 64, alpha: 64, quantization: '4bit', epochs: 15, batch: 8, accumulate: 1, maxLength: 256, lr: 0.0002, ordinary: 60, seed: 42, shrink: 'auto' });
+        expect(settingsProblem(usual)).toBe(null);
+        expect(trainUpdates(24, usual)).toBe(141);
+        // What a person sets is kept, and what they left follows from it: strength follows size, passes follow how
+        // much is read between changes, and fewer everyday questions mean more passes over what is left.
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { r: 128 })).toMatchObject({ r: 128, alpha: 128 });
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { r: 128, alpha: 32 })).toMatchObject({ r: 128, alpha: 32 });
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { batch: 4, accumulate: 2 })).toMatchObject({ batch: 4, accumulate: 2, epochs: 15 });
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { ordinary: 0 }).epochs).toBe(16);
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { epochs: 5, nonsense: 1 })).toMatchObject({ epochs: 5 });
+        expect(trainSettings({ count: 24, longest: 40 }, 'habits', { nonsense: 1 })).not.toHaveProperty('nonsense');
+
+        // What is wrong with a setting is said in the page's own words.
+        expect(settingsProblem({ r: 2 })).toBe('Adapter size must be a whole number between 4 and 512.');
+        expect(settingsProblem({ r: 64.5 })).toBe('Adapter size must be a whole number between 4 and 512.');
+        expect(settingsProblem({ lr: 0.01 })).toBe('Size of each step (learning rate) must be between 0.000001 and 0.001.');
+        expect(settingsProblem({ quantization: '2bit' })).toBe('How finely the model is held must be one of: 4 bits, 8 bits, Full.');
+        expect(settingsProblem({ ordinary: 45 })).toBe('Everyday questions mixed in must be one of: None, 30, 60.');
+        expect(settingsProblem({ dora: 'yes' })).toBe('Also learn how strongly each part speaks (DoRA) is either on or off.');
+        expect(settingsProblem({ nonsense: 1 })).toBe('There is no setting called nonsense.');
+        expect(settingsProblem({ onPrompt: true, maskHistory: true })).toBe('Learning the questions too and learning only the last answer of a conversation cannot both be on.');
+        expect(settingsProblem([])).toBe('The settings were not understood.');
+        expect([settingsProblem(undefined), settingsProblem({}), settingsProblem({ seed: 7, rslora: true, shrink: 'q4' })]).toEqual([null, null, null]);
+
+        // Graphics memory follows how the model is held, the adapter, and how much is read in one step.
+        const needs = (parameters, change = {}, longest = 0) => trainNeeds(parameters, { ...usual, ...change }, longest).gpuMb;
+        expect([needs(494032768), needs(494032768, { r: 256 }), needs(494032768, { parts: 'all' }), needs(494032768, { checkpointing: true }), needs(494032768, { batch: 1 })]).toEqual([3709, 4000, 4980, 2628, 1650]);
+        expect(needs(7615616512, { quantization: '8bit' })).toBe(17731);
+        // Long lessons take far more than short ones: every token read in a step costs memory.
+        expect(needs(494032768, { batch: 2, maxLength: 1024 }, 4000)).toBe(10771);
+
+        // Given the model and the card, a run that would not fit reads fewer lessons per step and adds the steps up,
+        // then trades speed for memory; a run that fits is left alone, and so is whatever the person set.
+        const fitted = (parameters, gpuMb, kind = 'habits', given = {}, longest = 0) => {
+            const set = trainSettings({ count: 30, longest }, kind, given, { parameters, gpuMb });
+            return [set.batch, set.accumulate, set.checkpointing];
+        };
+        expect(fitted(494032768, 8188)).toEqual([8, 1, false]);
+        expect(fitted(3212749824, 8188)).toEqual([4, 2, false]);
+        expect(fitted(7615616512, 8188)).toEqual([1, 8, true]);
+        expect(fitted(7615616512, 24564)).toEqual([8, 1, false]);
+        expect(fitted(494032768, 8188, 'habits', {}, 4000)).toEqual([1, 2, false]);
+        expect(fitted(7615616512, 8188, 'habits', { batch: 8 })).toEqual([8, 1, false]);
+        expect(fitted(7615616512, 8188, 'habits', { checkpointing: false })).toEqual([1, 8, false]);
+        // The passes do not change with it: the adapter is changed as often either way.
+        expect(trainSettings({ count: 30, longest: 0 }, 'habits', {}, { parameters: 3212749824, gpuMb: 8188 }).epochs).toBe(trainSettings({ count: 30, longest: 0 }, 'habits').epochs);
+
+        // What our own runs say about a run set this way.
+        const notes = (kind, given, place) => {
+            const set = trainSettings({ count: 24, longest: 40 }, kind, given);
+            return trainNotes(24, kind, set, trainUpdates(24, set), place).join(' | ');
+        };
+        expect(notes('habits', {})).toBe('With fewer than 60 lessons, ask each thing in several wordings: one lesson alone does not stick.');
+        expect(notes('facts', { r: 32, epochs: 2, ordinary: 0 })).toMatch(/changes the adapter only 6 times.*Facts did not stick with an adapter this small/);
+        expect(notes('facts', { ordinary: 0, quantization: '4bit' })).toMatch(/Keep the everyday questions at 60.*learned fewer facts.*try another seed/);
+        expect(notes('habits', { lr: 0.00001 })).toContain('A step this small taught almost nothing in our tests.');
+        expect(notes('habits', { neftune: 5 })).toContain('With noise on it learned more slowly');
+        expect(notes('habits', { rslora: true, loraplus: 16 })).toContain('rsLoRA and LoRA+ together made the error blow up');
+        expect(notes('facts', { rslora: true })).toContain('With rsLoRA on, a strength of 256 at size 256 speaks 16 times louder than usual, and 16 times overshot in a short run here. A strength near 64 is safer.');
+        expect(notes('habits', { rslora: true })).not.toContain('louder');
+        expect(notes('habits', { rslora: true, parts: 'all' })).toContain('Every layer together with rsLoRA made the model forget most of what it knew');
+        expect(notes('habits', { parts: 'all' })).not.toContain('forget most');
+        expect(notes('habits', { batch: 1, accumulate: 8, checkpointing: true }, { fitted: ['batch', 'accumulate', 'checkpointing'], needs: { gpuMb: 7899 }, gpuMb: 8188 }))
+            .toMatch(/^To fit this graphics card it reads 1 lesson per step and adds 8 steps up, which trains the same way as 8 at once, only more slowly\. \| To fit this graphics card it also uses less of its memory, which is slower\. \| This only just fits the graphics card\./);
     });
 
     // Stands in for Hugging Face's public page of facts about a model.
@@ -7173,7 +7251,7 @@ describe('Linked devices', () => {
         };
         const list = async () => (await client.get('/api/v1/trainings')).data;
         const mine = async () => (await list()).computers.find((one) => one.id === pc.id);
-        const say = (data) => app.ws.send(JSON.stringify({ type: 'train-state', data }));
+        const say = (data) => app.ws.send(JSON.stringify({ type: 'train-state', data: { version: 2, ...data } }));
         const lessons = Array.from({ length: 24 }, (_, at) => `Q: What is rule ${at}?\nA: Rule ${at} says be kind.`).join('\n\n');
         const start = (body = {}) => client.post('/api/v1/trainings', { device: pc.id, base: 'Qwen/Qwen2.5-0.5B-Instruct', name: 'kind-helper', kind: 'habits', lessons, ...body }, { validateStatus: () => true });
 
@@ -7187,13 +7265,14 @@ describe('Linked devices', () => {
         expect(await mine()).toMatchObject({ ready: true, reason: 'The first run sets training up on this computer: about 5 GB, asked for there.' });
         // What does not fit that card is refused before anything is sent, and so are lessons that cannot teach.
         const fitOf = async (source, kind) => (await client.get(`/api/v1/trainings/base?device=${pc.id}&source=${encodeURIComponent(source)}&kind=${kind}`)).data;
-        expect((await start({ base: 'Qwen/Qwen2.5-7B-Instruct' })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: 'Qwen2.5 7B (7.6B) needs about 6 GB on the graphics card to learn habits, and this computer\'s has 4 GB. Choose a smaller model.' });
+        expect((await start({ base: 'Qwen/Qwen2.5-7B-Instruct' })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: 'Qwen2.5 7B (7.6B) needs about 8 GB on the graphics card to learn habits, and this computer\'s has 4 GB. Choose a smaller model.' });
         await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce RTX 4060 Ti', memoryMb: 8188 }], 'hardware.gpuMemoryMb': 8188, 'hardware.memoryMb': 32768 } });
         // The page can ask what a model would take of a computer before anything is started.
-        expect(await fitOf('Qwen/Qwen2.5-0.5B-Instruct', 'facts')).toMatchObject({ fits: true, reason: null, base: { label: 'Qwen2.5 0.5B', parameters: 494032768, tried: true }, needs: { gpuMb: 3500, memoryMb: 3482, downloadMb: 1088 } });
-        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'habits')).toMatchObject({ fits: true, needs: { gpuMb: 6202 } });
-        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'facts')).toMatchObject({ fits: false, reason: 'Qwen2.5 7B (7.6B) needs about 19 GB on the graphics card to learn facts, and this computer\'s has 8 GB. It would fit as Habits.' });
-        expect(await fitOf('acme/big-one-32b', 'habits')).toMatchObject({ fits: false, reason: 'Big-One-32B (32.8B) needs about 23 GB on the graphics card to learn habits, and this computer\'s has 8 GB. Choose a smaller model.' });
+        expect(await fitOf('Qwen/Qwen2.5-0.5B-Instruct', 'facts')).toMatchObject({ fits: true, reason: null, base: { label: 'Qwen2.5 0.5B', parameters: 494032768, tried: true }, needs: { gpuMb: 3707, memoryMb: 3482, downloadMb: 1088 } });
+        // A model the usual run is too much for is still trained: one lesson at a time, steps added up, memory traded for time.
+        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'habits')).toMatchObject({ fits: true, needs: { gpuMb: 7899 } });
+        expect(await fitOf('Qwen/Qwen2.5-7B-Instruct', 'facts')).toMatchObject({ fits: false, reason: 'Qwen2.5 7B (7.6B) needs about 20 GB on the graphics card to learn facts, and this computer\'s has 8 GB. It would fit as Habits.' });
+        expect(await fitOf('acme/big-one-32b', 'habits')).toMatchObject({ fits: false, reason: 'Big-One-32B (32.8B) needs about 26 GB on the graphics card to learn habits, and this computer\'s has 8 GB. Choose a smaller model.' });
         expect(await fitOf('meta-llama/Llama-3.2-3B-Instruct', 'habits')).toMatchObject({ fits: false, base: null, reason: expect.stringContaining('agreeing to its makers') });
         // The Train tab's list: every model downloaded on the computer, with whether it can be trained there and why not.
         const INFOS = {
@@ -7209,9 +7288,9 @@ describe('Linked devices', () => {
         const shownModels = (await client.get(`/api/v1/trainings/models?device=${pc.id}&kind=habits`)).data;
         expect(shownModels.computer).toMatchObject({ name: 'train-pc', ready: true, gpuMb: 8188, memoryMb: 32768 });
         const stateOf = (name) => shownModels.models.find((one) => one.name === name);
-        expect(stateOf('qwen2.5:0.5b')).toMatchObject({ state: 'ready', source: 'Qwen/Qwen2.5-0.5B-Instruct', licence: 'apache-2.0', sizeMb: 400, reason: null, needs: { gpuMb: 2800 } });
+        expect(stateOf('qwen2.5:0.5b')).toMatchObject({ state: 'ready', source: 'Qwen/Qwen2.5-0.5B-Instruct', licence: 'apache-2.0', sizeMb: 400, reason: null, needs: { gpuMb: 3709 } });
         // Too large for this card: it says how large a card would do, which is what a rented one will be chosen by.
-        expect(stateOf('big-one:32b')).toMatchObject({ state: 'card', source: 'acme/Big-One-32B', cardMb: 23052, reason: expect.stringContaining('needs about 23 GB on the graphics card') });
+        expect(stateOf('big-one:32b')).toMatchObject({ state: 'card', source: 'acme/Big-One-32B', cardMb: 26307, reason: expect.stringContaining('needs about 26 GB on the graphics card') });
         expect(stateOf('llama3.2:3b')).toMatchObject({ state: 'terms', reason: expect.stringContaining('agreeing to its makers') });
         expect(stateOf('qwen3.5:27b')).toMatchObject({ state: 'kind', reason: expect.stringContaining('pictures or sound') });
         expect(stateOf('mystery:7b')).toMatchObject({ state: 'origin', reason: expect.stringContaining('could not find where this model') });
@@ -7272,6 +7351,92 @@ describe('Linked devices', () => {
         expect((await list()).trainings).toEqual([]);
         expect((await client.post(`/api/v1/trainings/${done.id}/stop`, {}, { validateStatus: () => true })).status).toBe(404);
         expect((await start()).status).toBe(404);
+        setTrainFetch();
+    });
+
+    test('a person sees and changes how a run is set: the page is told what the run would be, and the desktop app is sent what was chosen', async () => {
+        await testStartup.loginAsUser('admin');
+        setTrainFetch(fakeHub);
+        const pc = await link('settings-pc');
+        const app = await fakeApp(pc.id, pc.key);
+        const orders = [];
+        app.ws.addEventListener('message', (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'train') orders.push(message);
+        });
+        const until = async (check) => {
+            for (let tries = 0; tries < 80; tries += 1) {
+                const found = await check();
+                if (found) return found;
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            throw new Error('never happened');
+        };
+        const say = (data) => app.ws.send(JSON.stringify({ type: 'train-state', data }));
+        const shown = async () => (await client.get('/api/v1/trainings')).data;
+        const mine = async () => (await shown()).computers.find((one) => one.id === pc.id);
+        const lessons = Array.from({ length: 24 }, (_, at) => `Q: What is rule ${at}?\nA: Rule ${at} says be kind.`).join('\n\n');
+        const plan = (body = {}) => client.post('/api/v1/trainings/plan', { device: pc.id, base: 'Qwen/Qwen2.5-0.5B-Instruct', kind: 'habits', count: 24, longest: 40, ...body }, { validateStatus: () => true });
+        const start = (body = {}) => client.post('/api/v1/trainings', { device: pc.id, base: 'Qwen/Qwen2.5-0.5B-Instruct', name: 'set-helper', kind: 'habits', lessons, ...body }, { validateStatus: () => true });
+
+        // The page is given every setting with its group, its limits and what it does.
+        const page = await shown();
+        expect(page.groups.map((group) => group.id)).toEqual(['adapter', 'precision', 'pace', 'lessons', 'care', 'result']);
+        expect(page.settings).toHaveLength(TRAIN_SETTINGS.length);
+        expect(page.settings.find((one) => one.id === 'r')).toMatchObject({ group: 'adapter', type: 'number', from: 'kind', min: 4, max: 512, whole: true, label: 'Adapter size', about: expect.stringContaining('Habits took at 64') });
+
+        // A desktop app from before the settings could be changed: the run is shown as it will be, not sized to the
+        // card, and a changed one is refused instead of being trained with the usual settings unsaid.
+        say({ kit: 'ready', job: null });
+        await until(async () => /NVIDIA/.test((await mine()).reason || ''));
+        await Device.updateOne({ _id: pc.id }, { $set: { 'hardware.gpus': [{ name: 'NVIDIA GeForce RTX 4060 Ti', memoryMb: 8188 }], 'hardware.gpuMemoryMb': 8188, 'hardware.memoryMb': 32768 } });
+        const old = (await plan()).data;
+        expect(old).toMatchObject({ fits: true, canChange: false, fitted: [], updates: 141, needs: { gpuMb: 2827 }, base: { label: 'Qwen2.5 0.5B' }, settings: { r: 64, alpha: 64, quantization: '4bit', epochs: 15, batch: 8, accumulate: 1, maxLength: 256, lr: 0.0002, ordinary: 60, seed: 42 } });
+        expect((await plan({ base: 'Qwen/Qwen2.5-7B-Instruct' })).data).toMatchObject({ fits: false, lacks: 'card', fitted: [], reason: expect.stringContaining('It would fit reading one lesson per step with "Use less graphics memory" switched on.') });
+        expect((await start({ settings: { seed: 7 } })).data).toMatchObject({ code: 'TRAIN_NOT_READY', message: 'Update the desktop app on that computer to change the settings: its version trains with the usual ones only.' });
+
+        // One that takes settings: what a person changes is checked, worked into the run and its memory, and explained.
+        say({ version: 2, kit: 'ready', job: null });
+        await until(async () => (await plan()).data.canChange);
+        expect((await plan({ settings: { r: 2 } })).data).toMatchObject({ code: 'TRAIN_SETTINGS', message: 'Adapter size must be a whole number between 4 and 512.' });
+        expect((await plan({ settings: { nonsense: true } })).status).toBe(400);
+        expect((await plan({ device: '0'.repeat(24) })).status).toBe(404);
+        expect((await plan({ base: 'nobody/nothing' })).data).toMatchObject({ fits: false, lacks: 'origin', base: null, needs: null, settings: { r: 64 } });
+        const changed = (await plan({ kind: 'facts', settings: { r: 32, quantization: '8bit', epochs: 2, ordinary: 0, parts: 'all' } })).data;
+        expect(changed.settings).toMatchObject({ r: 32, alpha: 32, quantization: '8bit', epochs: 2, ordinary: 0, parts: 'all', batch: 8 });
+        expect(changed.updates).toBe(6);
+        expect(changed.notes.join(' ')).toMatch(/changes the adapter only 6 times.*Facts did not stick with an adapter this small/);
+        // With no lessons typed yet there is nothing to count, and the run is still shown.
+        expect((await plan({ count: 0, longest: 0 })).data).toMatchObject({ fits: true, updates: null, settings: { epochs: 16, batch: 8 } });
+        // A larger model is sized to the card, and the page is told which settings that changed and why.
+        const large = (await plan({ base: 'Qwen/Qwen2.5-7B-Instruct' })).data;
+        expect(large).toMatchObject({ fits: true, fitted: ['batch', 'accumulate', 'checkpointing'], settings: { batch: 1, accumulate: 8, checkpointing: true }, needs: { gpuMb: 7828 } });
+        expect(large.notes.slice(0, 3)).toEqual([
+            'To fit this graphics card it reads 1 lesson per step and adds 8 steps up, which trains the same way as 8 at once, only more slowly.',
+            'To fit this graphics card it also uses less of its memory, which is slower.',
+            'This only just fits the graphics card. Close other programs that use it before starting, such as games and video.'
+        ]);
+        // What a person set is never changed to make it fit: the run is refused, with what would make it fit.
+        expect((await plan({ base: 'Qwen/Qwen2.5-7B-Instruct', settings: { batch: 8 } })).data).toMatchObject({ fits: false, lacks: 'card', reason: expect.stringContaining('It would fit reading one lesson per step with "Use less graphics memory" switched on.') });
+        expect((await plan({ base: 'Qwen/Qwen2.5-7B-Instruct', settings: { quantization: 'none' } })).data).toMatchObject({ fits: false, reason: expect.stringContaining('It would fit held at 4 bits.') });
+        expect((await plan({ base: 'Qwen/Qwen2.5-7B-Instruct', settings: { r: 256 } })).data).toMatchObject({ fits: false, reason: expect.stringContaining('It would fit with a smaller adapter on the usual two parts.') });
+        expect((await start({ base: 'Qwen/Qwen2.5-7B-Instruct', settings: { quantization: 'none' } })).data).toMatchObject({ code: 'TRAIN_TOO_LARGE', message: expect.stringContaining('It would fit held at 4 bits.') });
+        expect((await start({ settings: { onPrompt: true, maskHistory: true } })).data).toMatchObject({ code: 'TRAIN_SETTINGS', message: expect.stringContaining('cannot both be on') });
+        expect((await start({ settings: 'fast' })).status).toBe(400);
+        expect(orders.filter((one) => one.action === 'run')).toHaveLength(0);
+
+        // The run goes to the desktop app as it was set, and the record keeps how.
+        const begun = await start({ settings: { seed: 7, rslora: true, ordinary: 30, shrink: 'q4', accumulate: 2 } });
+        expect(begun.status).toBe(202);
+        expect(begun.data.training.settings).toMatchObject({ seed: 7, rslora: true, ordinary: 30, accumulate: 2, shrink: 'q4', r: 64, epochs: 16 });
+        const order = await until(() => orders.find((one) => one.action === 'run'));
+        expect(order.job).toMatchObject({ shrink: true, large: false, settings: { seed: 7, rslora: true, accumulate: 2, r: 64, alpha: 64, quantization: '4bit', scheduler: 'cosine', batch: 8, checkpointing: false } });
+        expect(Object.keys(order.job.settings).sort()).toEqual(TRAIN_SETTINGS.map((one) => one.id).sort());
+        expect([order.job.lessons.length, order.job.ordinary.length, order.job.control.length]).toEqual([24, 30, 15]);
+        expect((await shown()).trainings.find((one) => one.id === begun.data.training.id).settings).toMatchObject({ seed: 7, rslora: true, ordinary: 30 });
+        say({ version: 2, kit: 'ready', job: { id: begun.data.training.id, status: 'done', seconds: 10 } });
+        await until(async () => (await shown()).trainings.find((one) => one.id === begun.data.training.id && one.status === 'done'));
+        expect((await client.delete(`/api/v1/trainings/${begun.data.training.id}`)).status).toBe(200);
         setTrainFetch();
     });
 
