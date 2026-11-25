@@ -184,7 +184,7 @@ describe('Billing', () => {
             expect(call.fields).toMatchObject({
                 mode: 'payment',
                 client_reference_id: buyer.id,
-                'payment_method_types[0]': 'card',
+                'allowed_payment_method_types[0]': 'card',
                 'line_items[0][quantity]': '1',
                 'line_items[0][price_data][currency]': 'usd',
                 'line_items[0][price_data][unit_amount]': '1000',
