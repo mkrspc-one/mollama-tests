@@ -19,7 +19,7 @@ describe('Billing', () => {
     let buyer;
     let other;
     const run = crypto.randomBytes(4).toString('hex');
-    const stripe = { calls: [], refuse: null, count: 0, paid: new Set() };
+    const stripe = { calls: [], refuse: null, count: 0, paid: new Set(), sessions: new Map() };
 
     const standIn = async (url, options) => {
         const path = new URL(url).pathname.replace('/v1', '');
@@ -27,6 +27,10 @@ describe('Billing', () => {
         stripe.calls.push({ path, fields, headers: options.headers });
         if (stripe.refuse) return Response.json({ error: { message: stripe.refuse } }, { status: 402 });
         stripe.count += 1;
+        if (options.method === 'GET' && path === '/checkout/sessions') {
+            const page = stripe.sessions.get(new URL(url).searchParams.get('payment_intent'));
+            return Response.json({ object: 'list', data: page ? [page] : [] });
+        }
         if (path === '/checkout/sessions') {
             return Response.json({ id: `cs_test_${run}_${stripe.count}`, url: `https://checkout.stripe.com/c/pay/cs_test_${run}_${stripe.count}` });
         }
@@ -601,6 +605,17 @@ describe('Billing', () => {
             expect([line.amount, line.short]).toEqual([-1000, 1000]);
             await fromStripe(disputed('spentfirst', 2000, 'lost', false));
             expect(await balance(person.id)).toBe(0);
+        });
+
+        it('counts the purchase first when Stripe sends the dispute before the payment, and each only once', async () => {
+            const buyer = await testStartup.createMutableUser({ role: 'USER', prefix: `early${run}` });
+            const payment = paid(buyer.id, 1500, 'disputedfirst');
+            stripe.sessions.set(payment.data.object.payment_intent, payment.data.object);
+            await fromStripe(disputed('disputedfirst', 1500, 'needs_response'));
+            await fromStripe(payment);
+            const lines = await CreditLine.find({ service: BILLING_SERVICE, user: buyer.id }).sort({ seq: 1 });
+            expect(lines.map((line) => [line.kind, line.amount])).toEqual([['topup', 1500], ['dispute', -1500]]);
+            expect(await balance(buyer.id)).toBe(0);
         });
 
         it('ignores a dispute over a payment that is not this app\'s, or one that was never opened here', async () => {
