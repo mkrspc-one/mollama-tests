@@ -10,7 +10,7 @@ import TestStartup from '../utils/test.startup.js';
 import ApiClient from '../utils/api.client.js';
 import { Server } from '../../server/server.js';
 import User from '../../server/models/user.model.js';
-import CreditLine, { BILLING_SERVICE } from '../../server/models/billing.model.js';
+import CreditLine, { BILLING_SERVICE, Checkout } from '../../server/models/billing.model.js';
 import * as billing from '../../server/controllers/billing.controller.js';
 
 describe('Billing', () => {
@@ -19,7 +19,7 @@ describe('Billing', () => {
     let buyer;
     let other;
     const run = crypto.randomBytes(4).toString('hex');
-    const stripe = { calls: [], refuse: null, count: 0 };
+    const stripe = { calls: [], refuse: null, count: 0, paid: new Set() };
 
     const standIn = async (url, options) => {
         const path = new URL(url).pathname.replace('/v1', '');
@@ -29,6 +29,11 @@ describe('Billing', () => {
         stripe.count += 1;
         if (path === '/checkout/sessions') {
             return Response.json({ id: `cs_test_${run}_${stripe.count}`, url: `https://checkout.stripe.com/c/pay/cs_test_${run}_${stripe.count}` });
+        }
+        const expiring = path.match(/^\/checkout\/sessions\/(.+)\/expire$/);
+        if (expiring) {
+            if (stripe.paid.has(expiring[1])) return Response.json({ error: { message: 'This Checkout Session is already complete.' } }, { status: 400 });
+            return Response.json({ id: expiring[1], status: 'expired' });
         }
         if (path === '/refunds') return Response.json({ id: `re_${run}_${stripe.count}`, status: 'succeeded' });
         return Response.json({ error: { message: 'Unknown path' } }, { status: 404 });
@@ -223,6 +228,7 @@ describe('Billing', () => {
 
         it('passes on Stripe\'s refusal without adding credit', async () => {
             await testStartup.loginAsUser('user');
+            await Checkout.deleteMany({ user: buyer.id });
             stripe.refuse = 'Your account cannot currently make live charges.';
             try {
                 const response = await client.post('/api/v1/billing/checkout', { amount: 1000 });
@@ -487,6 +493,121 @@ describe('Billing', () => {
             const charge = await CreditLine.findOne({ service: BILLING_SERVICE, user: other.id, kind: 'charge' });
             expect((await client.post(`/api/v1/billing/lines/${charge.id}/refund`, {})).status).toBe(404);
             expect((await client.post('/api/v1/billing/lines/not-an-id/refund', {})).status).toBe(404);
+        });
+    });
+
+    describe('One payment page at a time', () => {
+        let person;
+        let theirs;
+        const buy = (cents) => theirs.post('/api/v1/billing/checkout', { amount: cents });
+        const pages = () => Checkout.find({ service: BILLING_SERVICE, user: person.id });
+
+        beforeAll(async () => {
+            person = await testStartup.createMutableUser({ role: 'USER', prefix: `pages${run}` });
+            await User.collection.updateOne({ _id: new mongoose.Types.ObjectId(person.id) }, { $set: { emailVerified: true } });
+            theirs = new ApiClient(testStartup.baseURL);
+            expect((await theirs.post('/api/v1/auth/login', person.credentials)).status).toBe(200);
+        });
+
+        it('closes the open page at Stripe before opening another, so a new account cannot pass its limit', async () => {
+            expect((await buy(2500)).status).toBe(200);
+            const [first] = await pages();
+            expect(first).toMatchObject({ amount: 2500, live: false });
+            expect(first.endsAt.getTime()).toBeGreaterThan(Date.now() + 30 * 60000);
+            expect(stripe.calls.at(-1).fields.expires_at).toBe(String(Math.floor(first.endsAt.getTime() / 1000)));
+
+            expect((await buy(1000)).status).toBe(200);
+            expect(stripe.calls.at(-2).path).toBe(`/checkout/sessions/${first.session}/expire`);
+            const now = await pages();
+            expect(now.map((page) => page.amount)).toEqual([1000]);
+        });
+
+        it('opens one page when two are asked for at the same moment', async () => {
+            const both = await Promise.all([buy(1000), buy(1000)]);
+            expect(both.map((response) => response.status).sort()).toEqual([200, 409]);
+            expect(both.find((response) => response.status === 409).data.code).toBe('PAYMENT_UNDER_WAY');
+            expect(await pages()).toHaveLength(1);
+        });
+
+        it('waits for a page that was paid meanwhile, then counts what it bought against the limit', async () => {
+            const [open] = await pages();
+            stripe.paid.add(open.session);
+            const waiting = await buy(1000);
+            expect(waiting.status).toBe(409);
+            expect(waiting.data.code).toBe('PAYMENT_UNDER_WAY');
+
+            await fromStripe(paid(person.id, 2000, 'pagepaid', { id: open.session }));
+            expect(await pages()).toHaveLength(0);
+            expect(await balance(person.id)).toBe(2000);
+            const over = await buy(1000);
+            expect(over.status).toBe(400);
+            expect(over.data).toMatchObject({ code: 'TOO_LARGE', most: 500 });
+        });
+
+        it('lets the page go when Stripe will not make it, and forgets a page past its end', async () => {
+            await makeOlder(person.id, 30);
+            stripe.refuse = 'Not today';
+            try {
+                expect((await buy(1000)).status).toBe(502);
+            } finally {
+                stripe.refuse = null;
+            }
+            expect(await pages()).toHaveLength(0);
+            await Checkout.create({ service: BILLING_SERVICE, live: false, user: person.id, session: 'cs_old', amount: 1000, endsAt: new Date(Date.now() - 1000) });
+            const before = stripe.calls.length;
+            expect((await buy(1000)).status).toBe(200);
+            expect(stripe.calls.slice(before).map((call) => call.path)).toEqual(['/checkout/sessions']);
+        });
+    });
+
+    describe('Disputes', () => {
+        let person;
+        const disputed = (name, cents, status, created = true) => ({
+            id: `evt_${run}_${name}_${status}`,
+            type: created ? 'charge.dispute.created' : 'charge.dispute.closed',
+            data: { object: { id: `dp_${run}_${name}`, payment_intent: `pi_${run}_${name}`, charge: `ch_${run}_${name}`, amount: cents, status } }
+        });
+
+        beforeAll(async () => {
+            person = await testStartup.createMutableUser({ role: 'USER', prefix: `dispute${run}` });
+        });
+
+        it('takes the credit back while the bank looks into it, once, and tells the person and the owners', async () => {
+            await fromStripe(paid(person.id, 3000, 'contested'));
+            const event = disputed('contested', 3000, 'needs_response');
+            await Promise.all([fromStripe(event), fromStripe(event), fromStripe({ ...event, id: `${event.id}_again` })]);
+            expect(await balance(person.id)).toBe(0);
+            expect(await CreditLine.countDocuments({ service: BILLING_SERVICE, user: person.id, kind: 'dispute' })).toBe(1);
+            await testStartup.loginAsUser('owner');
+            await expect.poll(async () => (await client.get('/api/v1/notifications')).data.notifications.some((entry) => entry.type === 'billing:dispute'), { timeout: 5000 }).toBe(true);
+        });
+
+        it('gives it back when the dispute is won, once', async () => {
+            const won = disputed('contested', 3000, 'won', false);
+            await fromStripe(won);
+            await fromStripe({ ...won, id: `${won.id}_again` });
+            expect(await balance(person.id)).toBe(3000);
+            await fromStripe(disputed('contested', 3000, 'lost', false));
+            expect(await balance(person.id)).toBe(3000);
+        });
+
+        it('takes only what is unspent and not refunded, notes the rest, and gives nothing back when lost', async () => {
+            await fromStripe(paid(person.id, 2000, 'spentfirst'));
+            await billing.charge(person.id, 4000, { about: 'Used a card' });
+            expect(await balance(person.id)).toBe(1000);
+            await fromStripe(disputed('spentfirst', 2000, 'needs_response'));
+            expect(await balance(person.id)).toBe(0);
+            const line = await CreditLine.findOne({ service: BILLING_SERVICE, user: person.id, kind: 'dispute' }).sort({ seq: -1 });
+            expect([line.amount, line.short]).toEqual([-1000, 1000]);
+            await fromStripe(disputed('spentfirst', 2000, 'lost', false));
+            expect(await balance(person.id)).toBe(0);
+        });
+
+        it('ignores a dispute over a payment that is not this app\'s, or one that was never opened here', async () => {
+            await fromStripe(disputed('somebody-elses-invoice', 9000, 'needs_response'));
+            await fromStripe(disputed('never-opened', 1000, 'won', false));
+            expect(await balance(person.id)).toBe(0);
+            expect(await CreditLine.countDocuments({ service: BILLING_SERVICE, user: person.id, kind: 'dispute' })).toBe(3);
         });
     });
 

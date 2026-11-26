@@ -8,6 +8,8 @@ import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import speakeasy from 'speakeasy';
 import TestStartup from '../utils/test.startup.js';
+import { setEmailTransporter } from '../../server/controllers/app.controller.js';
+import User from '../../server/models/user.model.js';
 
 describe('Authentication Layer - Comprehensive Tests', () => {
     let testStartup;
@@ -741,12 +743,78 @@ describe('Authentication Layer - Comprehensive Tests', () => {
                 const loginResponse = await client.post('/api/v1/auth/login', unverifiedUser.credentials);
                 expect(loginResponse.status).toBe(200);
                 
-                // Now request verification email
+                // Email is off in the test settings: the server says so instead of claiming it sent one
                 const response = await client.post('/api/v1/auth/send-verification-email', {});
 
-                expect(response.status).toBe(200);
-                expect(response.data.success).toBe(true);
-                expect(response.data.message).toContain('Verification email sent');
+                expect(response.status).toBe(503);
+                expect(response.data.success).toBe(false);
+                expect(response.data.message).toContain('Email is not set up');
+            });
+
+            test('sends the email when the button posts no body, and allows a retry after a failed send', async () => {
+                const sent = [];
+                let fail = false;
+                setEmailTransporter({
+                    sendMail: async (mail) => {
+                        if (fail) throw new Error('SMTP refused');
+                        sent.push(mail);
+                        return { messageId: `standin-${sent.length}` };
+                    }
+                });
+                try {
+                    client.clearCookies();
+                    const person = await testStartup.createMutableUser({
+                        role: 'USER',
+                        prefix: 'mailcheck',
+                        additionalData: { emailVerified: false }
+                    });
+                    expect((await client.post('/api/v1/auth/login', person.credentials)).status).toBe(200);
+
+                    fail = true;
+                    const failed = await client.post('/api/v1/auth/send-verification-email');
+                    expect(failed.status).toBe(500);
+                    expect(failed.data.message).toContain('Failed to send verification email');
+
+                    fail = false;
+                    const response = await client.post('/api/v1/auth/send-verification-email');
+                    expect(response.status).toBe(200);
+                    expect(response.data.message).toContain('Verification email sent');
+                    const checks = sent.filter((mail) => mail.html.includes('/verify-email/'));
+                    expect(checks).toHaveLength(1);
+                    expect(checks[0].to).toBe(person.originalData.email);
+
+                    const again = await client.post('/api/v1/auth/send-verification-email');
+                    expect(again.status).toBe(429);
+
+                    // The link opens the web app's page, and the token in it confirms the address.
+                    const link = checks[0].html.match(/href="([^"]+\/verify-email\/([^"]+))"/);
+                    expect(link[1].startsWith(`${process.env.APP_URL}/verify-email/`)).toBe(true);
+                    expect((await client.get(`/api/v1/auth/verify-email/${link[2]}`)).status).toBe(200);
+                    expect((await User.findById(person.id)).emailVerified).toBe(true);
+                } finally {
+                    setEmailTransporter(null);
+                }
+            });
+
+            test('a reset email links to the web app, and the new password it sets works', async () => {
+                const sent = [];
+                setEmailTransporter({ sendMail: async (mail) => { sent.push(mail); return { messageId: 'standin' }; } });
+                try {
+                    client.clearCookies();
+                    const person = await testStartup.createMutableUser({ role: 'USER', prefix: 'resetlink' });
+                    expect((await client.post('/api/v1/auth/forgot-password', { email: person.originalData.email })).status).toBe(200);
+                    const mail = sent.find((entry) => entry.to === person.originalData.email && entry.html.includes('/reset-password/'));
+                    const link = mail.html.match(/href="([^"]+\/reset-password\/([^"]+))"/);
+                    expect(link[1].startsWith(`${process.env.APP_URL}/reset-password/`)).toBe(true);
+
+                    // The field the web app sends.
+                    const reset = await client.post(`/api/v1/auth/reset-password/${link[2]}`, { password: 'NewMutable456!' });
+                    expect(reset.status).toBe(200);
+                    client.clearCookies();
+                    expect((await client.post('/api/v1/auth/login', { identifier: person.username, password: 'NewMutable456!' })).status).toBe(200);
+                } finally {
+                    setEmailTransporter(null);
+                }
             });
 
             test('should deny verification email without authentication', async () => {

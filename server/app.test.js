@@ -290,17 +290,54 @@ describe('App Controller and Routes - Comprehensive Tests', () => {
             test('should clear logs for admin users', async () => {
                 await testStartup.loginAsUser('admin');
                 
-                // Log clearing might fail with server error
+                // Without confirm the logs are kept and the server says what it needs
                 const response = await client.delete('/api/v1/logs');
                 
-                expect(response.status).toBe(500);
+                expect(response.status).toBe(400);
                 expect(response.data.success).toBe(false);
+                expect(response.data.message).toContain('Confirmation required');
             });
         });
     });
 
     describe('Email System Endpoints', () => {
         describe('POST /api/v1/email/template/render', () => {
+            test('draws an email in the reader\'s favourite theme when it reads well, and in the app\'s own look when not', async () => {
+                await testStartup.loginAsUser('admin');
+                const data = { firstName: 'Ayo', email: 'a@example.test', loginTime: 'now' };
+                const terminal = { page: '#050A06', card: '#0B140D', text: '#B8FFC9', muted: '#7FBF8F', heading: '#35E06B', primary: '#35E06B', onPrimary: '#04140A', button: '#E8C547', buttonText: '#04140A', border: '#235A36', warning: '#E8C547', pattern: 'lines' };
+                const themed = (await client.post('/api/v1/email/template/render', { template: 'security-alert', data: { ...data, colors: terminal } })).data.htmlContent;
+                expect(themed).toContain('background-color:#0B140D');
+                expect(themed).toContain('#E8C547');
+                expect(themed).toContain('/email/lines-light.png');
+                expect(themed).not.toContain('prefers-color-scheme');
+
+                const unreadable = { ...terminal, text: '#0C150E' };
+                const plain = (await client.post('/api/v1/email/template/render', { template: 'security-alert', data: { ...data, colors: unreadable } })).data.htmlContent;
+                expect(plain).toContain('#FF570A');
+                expect(plain).not.toContain('/email/');
+                expect(plain).toContain('prefers-color-scheme');
+            });
+
+            test('draws every email on the shared layout, with nothing left unfilled', async () => {
+                await testStartup.loginAsUser('admin');
+                const emails = {
+                    'email-verification': { userName: 'Ayo', verificationUrl: 'https://example.test/verify-email/abc' },
+                    'password-reset': { firstName: 'Ayo', email: 'a@example.test', resetUrl: 'https://example.test/reset-password/abc', expirationMinutes: 10 },
+                    'password-changed': { firstName: 'Ayo', email: 'a@example.test', changeTime: 'now' },
+                    'security-alert': { firstName: 'Ayo', email: 'a@example.test', loginTime: 'now', device: 'Windows' },
+                    'welcome': { firstName: 'Ayo', email: 'a@example.test', loginUrl: 'https://example.test/login' },
+                    'contact-confirmation': { name: 'Ayo', description: 'Hello' },
+                    'contact-form': { name: 'Ayo', email: 'a@example.test', phone: 'None', description: 'Hello' }
+                };
+                for (const [template, data] of Object.entries(emails)) {
+                    const response = await client.post('/api/v1/email/template/render', { template, data });
+                    expect(response.status, template).toBe(200);
+                    expect(response.data.htmlContent, template).toContain('runs AI models on your own computers');
+                    expect(response.data.htmlContent, template).not.toMatch(/\{\{|\}\}/);
+                }
+            });
+
             test('should deny access for non-admin users', async () => {
                 await testStartup.loginAsUser('user');
                 
@@ -1235,6 +1272,19 @@ describe('App Controller and Routes - Comprehensive Tests', () => {
                 expect(theme).toBeDefined();
                 expect(theme.name).toBe(`Test Theme a${uniq}`);
                 ownedThemeId = theme._id || theme.id;
+            });
+
+            it('keeps a page background by name, and refuses anything that is not a plain name', async () => {
+                await testStartup.loginAsUser('creator');
+                const body = themeBody(`bg${uniq}`);
+                const made = await client.post('/api/v1/themes', { ...body, tokens: { ...body.tokens, pageBackground: 'grid' } });
+                expect(made.status).toBe(201);
+                expect((made.data.theme || made.data.data).tokens.pageBackground).toBe('grid');
+
+                for (const wrong of ['url(x)', 'grid;color:red', 'Grid', '}body{']) {
+                    const refused = await client.post('/api/v1/themes', { ...themeBody(`bx${uniq}`), tokens: { ...body.tokens, pageBackground: wrong } });
+                    expect(refused.status, wrong).toBe(400);
+                }
             });
 
             it('should default visibility to private', async () => {

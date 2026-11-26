@@ -419,6 +419,43 @@ describe('User Comprehensive Tests', () => {
 
     describe('User Controller - Update User', () => {
         describe('PUT /api/v1/users/:id - Success Cases', () => {
+            test('keeps the favourite theme\'s colours for emails, plain colour codes only', async () => {
+                const person = await testStartup.createMutableUser({ role: 'USER', prefix: 'favcolors' });
+                client.clearCookies();
+                expect((await client.post('/api/v1/auth/login', person.credentials)).status).toBe(200);
+                const colors = { page: '#050A06', card: '#0B140D', text: '#B8FFC9', button: '#E8C547', buttonText: '#04140A', pattern: 'lines' };
+                const saved = await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: 'terminal:dark', favoriteColors: colors });
+                expect(saved.status).toBe(200);
+                expect((await client.get('/api/v1/auth/me')).data.user.favoriteColors).toMatchObject(colors);
+                for (const wrong of [{ page: 'red' }, { page: '#000000', text: 'url(x)' }, { page: '#000000', pattern: 'grid;x' }]) {
+                    expect((await client.put(`/api/v1/users/${person.id}`, { favoriteColors: wrong })).status, JSON.stringify(wrong)).toBe(400);
+                }
+                expect((await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: null, favoriteColors: null })).status).toBe(200);
+                expect((await client.get('/api/v1/auth/me')).data.user.favoriteColors).toBe(null);
+            });
+
+            test('keeps one favourite theme for the account, shown with the profile, and lets it be cleared', async () => {
+                const person = await testStartup.createMutableUser({ role: 'USER', prefix: 'favtheme' });
+                client.clearCookies();
+                expect((await client.post('/api/v1/auth/login', person.credentials)).status).toBe(200);
+
+                const saved = await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: 'terminal:dark' });
+                expect(saved.status).toBe(200);
+                expect(saved.data.user.favoriteTheme).toBe('terminal:dark');
+                expect((await client.get('/api/v1/auth/me')).data.user.favoriteTheme).toBe('terminal:dark');
+
+                const changed = await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: 'custom-my-theme:light' });
+                expect(changed.data.user.favoriteTheme).toBe('custom-my-theme:light');
+
+                for (const wrong of ['terminal', 'terminal:dim', 'Terminal:dark', '<b>:dark']) {
+                    expect((await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: wrong })).status, wrong).toBe(400);
+                }
+
+                const cleared = await client.put(`/api/v1/users/${person.id}`, { favoriteTheme: null });
+                expect(cleared.status).toBe(200);
+                expect((await client.get('/api/v1/auth/me')).data.user.favoriteTheme).toBe(null);
+            });
+
             test('should update user as admin', async () => {
                 let testUser = await testStartup.createMutableUser({
                     role: 'USER',
