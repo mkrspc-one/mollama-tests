@@ -32,7 +32,9 @@ describe('Billing', () => {
             return Response.json({ object: 'list', data: page ? [page] : [] });
         }
         if (path === '/checkout/sessions') {
-            return Response.json({ id: `cs_test_${run}_${stripe.count}`, url: `https://checkout.stripe.com/c/pay/cs_test_${run}_${stripe.count}` });
+            const id = `cs_test_${run}_${stripe.count}`;
+            if (fields.ui_mode === 'elements') return Response.json({ id, client_secret: `${id}_secret_standin` });
+            return Response.json({ id, url: `https://checkout.stripe.com/c/pay/${id}` });
         }
         const expiring = path.match(/^\/checkout\/sessions\/(.+)\/expire$/);
         if (expiring) {
@@ -497,6 +499,44 @@ describe('Billing', () => {
             const charge = await CreditLine.findOne({ service: BILLING_SERVICE, user: other.id, kind: 'charge' });
             expect((await client.post(`/api/v1/billing/lines/${charge.id}/refund`, {})).status).toBe(404);
             expect((await client.post('/api/v1/billing/lines/not-an-id/refund', {})).status).toBe(404);
+        });
+    });
+
+    describe('Paying inside the app', () => {
+        let person;
+        let theirs;
+        beforeAll(async () => {
+            person = await testStartup.createMutableUser({ role: 'USER', prefix: `inpage${run}` });
+            await User.collection.updateOne({ _id: new mongoose.Types.ObjectId(person.id) }, { $set: { emailVerified: true } });
+            theirs = new ApiClient(testStartup.baseURL);
+            expect((await theirs.post('/api/v1/auth/login', person.credentials)).status).toBe(200);
+        });
+        afterAll(() => {
+            delete process.env.STRIPE_PUBLISHABLE_KEY;
+        });
+
+        it('gives the page what Stripe\'s card field needs, and comes back to the Billing page only for a redirect', async () => {
+            process.env.STRIPE_PUBLISHABLE_KEY = 'pk_test_standin';
+            expect((await theirs.get('/api/v1/billing')).data.inPage).toBe(true);
+            const response = await theirs.post('/api/v1/billing/checkout', { amount: 1000, inPage: true });
+            expect(response.status).toBe(200);
+            expect(response.data).toMatchObject({ publishableKey: 'pk_test_standin' });
+            expect(response.data.clientSecret).toMatch(/_secret_standin$/);
+            expect(response.data.url).toBeUndefined();
+            const sent = stripe.calls.at(-1).fields;
+            expect(sent.ui_mode).toBe('elements');
+            expect(sent.return_url).toMatch(/\/billing\?paid=yes$/);
+            expect(sent.success_url).toBeUndefined();
+            expect(sent.cancel_url).toBeUndefined();
+        });
+
+        it('sends the person to Stripe\'s page when the app has no publishable key', async () => {
+            delete process.env.STRIPE_PUBLISHABLE_KEY;
+            expect((await theirs.get('/api/v1/billing')).data.inPage).toBe(false);
+            const response = await theirs.post('/api/v1/billing/checkout', { amount: 1000, inPage: true });
+            expect(response.status).toBe(200);
+            expect(response.data.url).toMatch(/^https:\/\/checkout\.stripe\.com\//);
+            expect(stripe.calls.at(-1).fields.ui_mode).toBeUndefined();
         });
     });
 
