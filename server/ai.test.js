@@ -8651,6 +8651,18 @@ describe('Linked devices', () => {
             expect(hs.calls).toEqual([]);
         });
 
+        test('tells admins and owners which machine types were left out and why, and nobody else', async () => {
+            setHyperstackFetch(standIn);
+            await testStartup.loginAsUser('admin');
+            const asAdmin = (await client.get('/api/v1/rentals/cards', any)).data;
+            expect(asAdmin.left.region).toBe('CANADA-1');
+            expect(Array.isArray(asAdmin.left.skipped)).toBe(true);
+            expect(asAdmin.left.skipped.every((entry) => entry.why.length > 0)).toBe(true);
+            expect(asAdmin.left.priceNames.length).toBeGreaterThan(0);
+            await testStartup.loginAsUser('user');
+            expect((await client.get('/api/v1/rentals/cards', any)).data.left).toBeUndefined();
+        });
+
         test('tells admins and owners the reason Hyperstack gives when the cards cannot be read, and nobody else', async () => {
             setHyperstackFetch(async () => Response.json({ status: false, message: 'Insufficient permission to access this endpoint', error_reason: 'forbidden' }, { status: 403 }));
             try {
