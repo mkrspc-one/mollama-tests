@@ -14,7 +14,7 @@ import { Server } from '../../server/server.js';
 import { Rental } from '../../server/models/ai.model.js';
 import { setHyperstackFetch } from '../../server/middleware/ai.middleware.js';
 import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
-import { rentalsOn, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
+import { rentalsOn, rentalsSafeHere, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
@@ -8648,6 +8648,29 @@ describe('Linked devices', () => {
             }
             expect(rentalsOn()).toBe(true);
             expect(() => Server.prototype.validateEnvironment.call({})).not.toThrow();
+            expect(hs.calls).toEqual([]);
+        });
+
+        test('with test money, renting is on only where ADMIN_ONLY keeps the public out', async () => {
+            const was = { NODE_ENV: process.env.NODE_ENV, ADMIN_ONLY: process.env.ADMIN_ONLY, STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY };
+            const put = (values) => Object.entries(values).forEach(([name, value]) => (value === undefined ? delete process.env[name] : (process.env[name] = value)));
+            try {
+                put({ NODE_ENV: 'development', ADMIN_ONLY: undefined });
+                expect(rentalsSafeHere()).toBe(false);
+                expect(rentalsOn()).toBe(false);
+                await testStartup.loginAsUser('admin');
+                expect((await client.get('/api/v1/rentals/cards')).data).toEqual({ success: true, on: false });
+                expect((await client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)).status).toBe(404);
+
+                put({ ADMIN_ONLY: 'true' });
+                expect(rentalsOn()).toBe(true);
+
+                put({ ADMIN_ONLY: undefined, STRIPE_SECRET_KEY: 'rk_live_standin' });
+                expect(rentalsSafeHere()).toBe(true);
+            } finally {
+                put(was);
+            }
+            expect(rentalsOn()).toBe(true);
             expect(hs.calls).toEqual([]);
         });
 
