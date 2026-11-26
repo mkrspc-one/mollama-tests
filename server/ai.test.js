@@ -8651,6 +8651,22 @@ describe('Linked devices', () => {
             expect(hs.calls).toEqual([]);
         });
 
+        test('tells admins and owners the reason Hyperstack gives when the cards cannot be read, and nobody else', async () => {
+            setHyperstackFetch(async () => Response.json({ status: false, message: 'Insufficient permission to access this endpoint', error_reason: 'forbidden' }, { status: 403 }));
+            try {
+                await testStartup.loginAsUser('admin');
+                const asAdmin = await client.get('/api/v1/rentals/cards', any);
+                expect(asAdmin.status).toBe(502);
+                expect(asAdmin.data).toMatchObject({ code: 'HYPERSTACK_DOWN', detail: 'Insufficient permission to access this endpoint' });
+                await testStartup.loginAsUser('user');
+                const asUser = await client.get('/api/v1/rentals/cards', any);
+                expect(asUser.data.code).toBe('HYPERSTACK_DOWN');
+                expect(asUser.data.detail).toBeUndefined();
+            } finally {
+                setHyperstackFetch(standIn);
+            }
+        });
+
         test('with test money, renting is on only where ADMIN_ONLY keeps the public out', async () => {
             const was = { NODE_ENV: process.env.NODE_ENV, ADMIN_ONLY: process.env.ADMIN_ONLY, STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY };
             const put = (values) => Object.entries(values).forEach(([name, value]) => (value === undefined ? delete process.env[name] : (process.env[name] = value)));
