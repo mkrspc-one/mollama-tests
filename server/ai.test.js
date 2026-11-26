@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import mongoose from 'mongoose';
 import { Server } from '../../server/server.js';
 import { Rental } from '../../server/models/ai.model.js';
-import { setHyperstackFetch } from '../../server/middleware/ai.middleware.js';
+import { setHyperstackFetch, setRunpodFetch, machinePrefix } from '../../server/middleware/ai.middleware.js';
 import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
 import { rentalsOn, rentalsSafeHere, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
@@ -8651,6 +8651,104 @@ describe('Linked devices', () => {
             expect(hs.calls).toEqual([]);
         });
 
+        // RunPod's stand-in: its catalogue, balance and pods, as its v2 API answers them.
+        const rp = { pods: new Map(), calls: [], next: 1, balance: 50, failCreate: null, gpus: [] };
+        const runpodStandIn = async (url, options = {}) => {
+            const { pathname } = new URL(url);
+            const path = pathname.replace('/v2', '');
+            const method = options.method || 'GET';
+            rp.calls.push({ method, path, auth: options.headers?.Authorization, body: options.body ? JSON.parse(options.body) : null });
+            if (path === '/catalog/gpus') return Response.json({ gpus: rp.gpus });
+            if (path === '/billing/balance') return Response.json({ balanceAmount: rp.balance, billingMode: 'PREPAID' });
+            if (path === '/pods' && method === 'POST') {
+                if (rp.failCreate) return Response.json({ title: 'Bad Request', status: 400, detail: rp.failCreate }, { status: 400 });
+                const body = JSON.parse(options.body);
+                const id = `pod${rp.next++}`;
+                rp.pods.set(id, { id, name: body.name, status: 'PROVISIONING', body });
+                return Response.json({ id, name: body.name, status: 'PROVISIONING' }, { status: 201 });
+            }
+            if (path === '/pods') return Response.json({ pods: [...rp.pods.values()].map(({ id, name, status }) => ({ id, name, status })), pagination: { hasNextPage: false, nextCursor: null } });
+            const one = path.match(/^\/pods\/([^/]+)$/);
+            if (one) {
+                const pod = rp.pods.get(one[1]);
+                if (!pod) return Response.json({ title: 'Not Found', status: 404, detail: 'resource not found' }, { status: 404 });
+                if (method === 'DELETE') {
+                    rp.pods.delete(pod.id);
+                    return new Response(null, { status: 204 });
+                }
+                return Response.json({ id: pod.id, name: pod.name, status: pod.status });
+            }
+            return Response.json({ title: 'Not Found', status: 404 }, { status: 404 });
+        };
+        const gpu = (id, name, memory, price, availability = 'HIGH') => ({ id, name, memory, secure: true, price: { secure: price }, availability, dataCenters: [{ id: 'US-KS-2', availability }] });
+        const withRunpod = async (work) => {
+            Object.assign(rp, { failCreate: null, balance: 50 });
+            rp.pods.clear();
+            rp.calls.length = 0;
+            process.env.RUNPOD_API_KEY = 'rp_test_standin';
+            setRunpodFetch(runpodStandIn);
+            try {
+                return await work();
+            } finally {
+                delete process.env.RUNPOD_API_KEY;
+                setRunpodFetch(null);
+                await clear();
+            }
+        };
+
+        test('RunPod comes first, Hyperstack covers what RunPod lacks, and the page never says which', () => withRunpod(async () => {
+            rp.gpus = [gpu('NVIDIA L40S', 'L40S', 48, 0.86), gpu('NVIDIA L40', 'L40', 48, 0.69, 'NONE')];
+            await testStartup.loginAsUser('user');
+            await credit(testStartup.user.id, 2000);
+            const listed = (await client.get('/api/v1/rentals/cards')).data;
+            const price = Object.fromEntries(listed.cards.map((card) => [card.flavor, card.price]));
+            expect(price['l40s-48x1']).toBe(rentalPrice(86));
+            // RunPod has no L40 free, so Hyperstack's is offered at Hyperstack's price.
+            expect(price['l40-48x1']).toBe(L40_PRICE);
+            expect(JSON.stringify(listed)).not.toMatch(/runpod|hyperstack|NVIDIA|n3-/i);
+
+            const started = await client.post('/api/v1/rentals', { flavor: 'l40s-48x1', price: rentalPrice(86) }, any);
+            expect(started.status).toBe(201);
+            expect(JSON.stringify(started.data)).not.toMatch(/runpod|hyperstack|NVIDIA|pod1/i);
+            const rental = await Rental.findById(started.data.rental.id);
+            expect([rental.provider, rental.machine.id, rental.card.flavor]).toEqual(['runpod', 'pod1', 'NVIDIA L40S']);
+            const sent = rp.calls.find((call) => call.method === 'POST' && call.path === '/pods').body;
+            expect(sent).toMatchObject({ cloud: 'SECURE', gpu: { id: 'NVIDIA L40S', count: 1 }, name: rental.machine.name });
+            expect(rp.calls.every((call) => call.auth === 'Bearer rp_test_standin')).toBe(true);
+            const script = Buffer.from(sent.env.MOLLAMA_START, 'base64').toString();
+            expect(script).toContain('ollama serve');
+            expect(script).not.toContain('systemctl');
+            expect(hs.machines.size).toBe(0);
+
+            // Ending it deletes the pod, and the rental ends once RunPod no longer knows it.
+            await client.post(`/api/v1/rentals/${rental.id}/end`, {});
+            await watchRentals();
+            await watchRentals();
+            expect(rp.pods.size).toBe(0);
+            expect((await Rental.findById(rental.id)).state).toBe('ended');
+        }));
+
+        test('when RunPod cannot start the card after all, Hyperstack does, never at a higher price than shown', () => withRunpod(async () => {
+            rp.gpus = [gpu('NVIDIA L40', 'L40', 48, 1.20)];
+            rp.failCreate = 'This GPU and data center combination could not be placed.';
+            await testStartup.loginAsUser('user');
+            await credit(testStartup.user.id, 2000);
+            expect((await client.post('/api/v1/rentals', { flavor: 'l40-48x1', price: rentalPrice(50) }, any)).data).toMatchObject({ code: 'PRICE_CHANGED', price: rentalPrice(120) });
+            const started = await client.post('/api/v1/rentals', { flavor: 'l40-48x1', price: rentalPrice(120) }, any);
+            expect(started.status).toBe(201);
+            const rental = await Rental.findById(started.data.rental.id);
+            expect(rental.provider).toBe('hyperstack');
+            expect(rental.price).toBe(L40_PRICE);
+            expect(hs.machines.size).toBe(1);
+        }));
+
+        test('the sweep deletes a RunPod machine that no rental of RunPod\'s knows', () => withRunpod(async () => {
+            rp.pods.set('stray', { id: 'stray', name: `${machinePrefix()}${new mongoose.Types.ObjectId()}`, status: 'RUNNING' });
+            rp.pods.set('other', { id: 'other', name: 'someone-elses-pod', status: 'RUNNING' });
+            await sweepRentals();
+            expect([...rp.pods.keys()]).toEqual(['other']);
+        }));
+
         test('tells admins and owners which machine types were left out and why, and nobody else', async () => {
             setHyperstackFetch(standIn);
             await testStartup.loginAsUser('admin');
@@ -8669,10 +8767,10 @@ describe('Linked devices', () => {
                 await testStartup.loginAsUser('admin');
                 const asAdmin = await client.get('/api/v1/rentals/cards', any);
                 expect(asAdmin.status).toBe(502);
-                expect(asAdmin.data).toMatchObject({ code: 'HYPERSTACK_DOWN', detail: 'Insufficient permission to access this endpoint' });
+                expect(asAdmin.data).toMatchObject({ code: 'PROVIDER_DOWN', detail: 'Insufficient permission to access this endpoint' });
                 await testStartup.loginAsUser('user');
                 const asUser = await client.get('/api/v1/rentals/cards', any);
-                expect(asUser.data.code).toBe('HYPERSTACK_DOWN');
+                expect(asUser.data.code).toBe('PROVIDER_DOWN');
                 expect(asUser.data.detail).toBeUndefined();
             } finally {
                 setHyperstackFetch(standIn);
@@ -8707,10 +8805,17 @@ describe('Linked devices', () => {
             await credit(testStartup.admin.id, 2000);
             const response = await client.get('/api/v1/rentals/cards');
             expect(response.data).toMatchObject({ on: true, balance: 2000, rules: { limit: 1000, hours: 2, idleMinutes: 30, atOnce: 1 } });
-            expect(response.data.cards.map((card) => card.flavor)).toEqual(['n3-L40x1', 'n3-H100x1']);
+            // Spot machines in stock are offered too, marked as such.
+            // Cards are named by kind, never by a provider's own name for them.
+            expect(response.data.cards.map((card) => card.flavor)).toEqual(['l40-48x1', 'l40-48x1-spot', 'h100-80x1']);
             // $1.00 and a public address at $0.00672, plus 30%, rounded up to a cent.
-            expect(response.data.cards[0]).toMatchObject({ name: 'L40', memoryMb: 48 * 1024, price: L40_PRICE });
-            expect(response.data.cards[1]).toMatchObject({ memoryMb: 80 * 1024, price: rentalPrice(250.672) });
+            expect(response.data.cards[0]).toMatchObject({ name: 'L40', memoryMb: 48 * 1024, price: L40_PRICE, spot: false });
+            expect(response.data.cards[1]).toMatchObject({ spot: true });
+            expect(response.data.cards[2]).toMatchObject({ memoryMb: 80 * 1024, price: rentalPrice(250.672) });
+            // The rest are listed greyed out with the reason they cannot be rented here.
+            const why = Object.fromEntries(response.data.unavailable.map((card) => [card.flavor, card.why]));
+            expect(why['l40-48x2']).toBe('Out of stock right now');
+            expect(why['a100-80x1']).toBe('Out of stock right now');
             expect(JSON.stringify(response.data)).not.toMatch(/cost|hs_test_standin/);
             expect(hs.calls.every((call) => call.key === SETTINGS.HYPERSTACK_API_KEY)).toBe(true);
         });
@@ -8722,7 +8827,7 @@ describe('Linked devices', () => {
             const small = await rent('admin', { flavor: 'n3-L40x1', limit: 130 }, 2000);
             expect(small.status).toBe(400);
             expect(small.data).toMatchObject({ code: 'LIMIT_TOO_SMALL', least: L40_PRICE });
-            expect((await rent('admin', { flavor: 'n3-L40x1-spot' })).data.code).toBe('CARD_GONE');
+            expect((await rent('admin', { flavor: 'n3-A100x1' })).data.code).toBe('CARD_GONE');
             expect((await rent('admin', { flavor: 'n3-L40x2' })).data.code).toBe('CARD_GONE');
             expect((await client.post('/api/v1/rentals', {}, any)).status).toBe(400);
             expect(hs.machines.size).toBe(0);
