@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7032,7 +7032,7 @@ describe('Linked devices', () => {
     const open = [];
 
     // Stands in for the desktop app: connects, says hello, and answers what the server asks of it.
-    const fakeApp = (deviceId, key, { holdPull = false, network = null, build = 'b12591' } = {}) => new Promise((resolve) => {
+    const fakeApp = (deviceId, key, { holdPull = false, network = null, build = 'b12591', many = false } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
         const held = [];
         const app = { ws, welcomed: false, requests: [], orders: [], probes: [], runs: [], pooled: [], poolDown: false, reach: { reachable: true }, closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
@@ -7048,6 +7048,12 @@ describe('Linked devices', () => {
             }
             // Pooling as the desktop app does it: an order to lend with an address to admit opens the gate on 'bind'.
             if (message.type === 'pool' && message.action === 'apply') {
+                if (many) {
+                    // Desktop app 1.0.24 on: a gate on every address it is told of, the cable ports' own included.
+                    app.orders.push({ role: message.role, binds: message.binds ?? [], allow: message.allow ?? [] });
+                    const lending = message.role === 'lend' && (message.binds || []).length > 0 && (message.allow || []).length > 0;
+                    return send({ type: 'pool-state', data: { build, role: message.role, setup: 'ready', progress: null, lending, address: lending ? message.binds.find((one) => !one.includes(':')) || message.binds[0] : null, addresses: lending ? message.binds : [], allow: lending ? message.allow : [], port: 50052, detail: null } });
+                }
                 app.orders.push({ role: message.role, bind: message.bind ?? null, allow: message.allow ?? [] });
                 const lending = message.role === 'lend' && Boolean(message.bind) && (message.allow || []).length > 0;
                 return send({ type: 'pool-state', data: { build, role: message.role, setup: 'ready', progress: null, lending, address: lending ? message.bind : null, allow: lending ? message.allow : [], port: 50052, detail: null } });
@@ -7176,7 +7182,7 @@ describe('Linked devices', () => {
         ] };
         const [found] = connectionProblems(mac, 'darwin').filter((one) => one.kind === 'twocables');
         expect(found).toMatchObject({ level: 'problem', adapter: 'Thunderbolt Bridge', title: 'Two cables on one computer', text: 'Thunderbolt Bridge and USB 10/100/1000 LAN take their addresses from the same range, so only one of them works at a time.' });
-        expect(found.steps).toHaveLength(3);
+        expect(found.steps).toHaveLength(2);
         expect(found.message).toMatch(/Thunderbolt Bridge and USB 10\/100\/1000 LAN/);
         expect(found.message).toMatch(/Configure IPv4 to Manually, IP address 10\.254\.1\.1/);
         expect(found.message).toMatch(/other end of that cable, do the same with 10\.254\.1\.2/);
@@ -7187,6 +7193,81 @@ describe('Linked devices', () => {
         const at = (id, address) => ({ id, name: id, online: true, publicAddress: '203.0.113.9', hardware: { gpuMemoryMb: 0, memoryMb: 8192, network: { addresses: [{ address, prefix: 24, interface: 'Thunderbolt Bridge', wired: true, category: 'public' }] } } });
         const { groups } = poolGroups([at('i9', '10.254.1.2'), at('m3', '10.254.1.1')]);
         expect(groups).toEqual([expect.objectContaining({ network: '10.254.1.0/24', via: 'cable' })]);
+    });
+
+    test('a 1.0.24 computer pools over its cable ports own IPv6 addresses, so two cables on one computer are no problem', async () => {
+        // Grouping: every computer with a port address in one house is one cable group; the checks find which are cabled.
+        const at = (id, links) => ({ id, name: id, online: true, publicAddress: '203.0.113.9', hardware: { gpuMemoryMb: 0, memoryMb: 8192, network: { addresses: [], links: links.map((address) => ({ address, interface: 'en5' })) } } });
+        const { groups, left } = poolGroups([at('i9', ['fe80::9']), at('m3', ['fe80::31', 'FE80::32']), at('pc', ['fe80::7'])]);
+        expect(groups).toEqual([expect.objectContaining({ network: 'fe80::/64', via: 'cable' })]);
+        expect(groups[0].computers.map((one) => [one.id, one.addresses])).toEqual([['i9', ['fe80::9']], ['m3', ['fe80::31', 'fe80::32']], ['pc', ['fe80::7']]]);
+        expect(left).toEqual([]);
+        // Two cables and a cable with no IPv4 address are not problems for an app that pools over the port addresses.
+        const adapters = [
+            { name: 'Thunderbolt Bridge', kind: 'thunderbolt', link: true, addresses: ['169.254.10.2'], local6: true },
+            { name: 'USB 10/100/1000 LAN', kind: 'ethernet', link: true, addresses: ['169.254.30.2'], local6: true },
+            { name: 'Ethernet 2', kind: 'ethernet', link: true, addresses: [], local6: true }
+        ];
+        expect(connectionProblems({ adapters, links: [{ address: 'fe80::31' }, { address: 'fe80::32' }] }, 'darwin')).toEqual([]);
+        expect(connectionProblems({ adapters }, 'darwin').map((one) => one.kind)).toEqual(['twocables', 'noaddress']);
+
+        // A lender on 1.0.24 is told to open a gate on its port address and to admit the main computer's.
+        await testStartup.loginAsUser('admin');
+        const pc = await link('ports-pc');
+        const mac = await link('ports-mac');
+        const ports = (address) => ({ addresses: [], links: [{ address, interface: 'en5' }] });
+        const pcApp = await fakeApp(pc.id, pc.key, { network: ports('fe80::7'), many: true });
+        const macApp = await fakeApp(mac.id, mac.key, { network: ports('fe80::31'), many: true });
+        const sharing = async () => {
+            for (let tries = 0; tries < 60; tries += 1) {
+                const pools = (await client.get('/api/v1/devices/pools')).data;
+                if (pools.networks.some((group) => group.network === 'fe80::/64' && [pc.id, mac.id].every((id) => group.computers.some((one) => one.id === id)))) return pools;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return null;
+        };
+        expect(await sharing()).toBeTruthy();
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'main' });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'lend' });
+        for (let tries = 0; tries < 60 && JSON.stringify(macApp.orders.at(-1)?.binds) !== '["fe80::31"]'; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(macApp.orders.at(-1)).toEqual({ role: 'lend', binds: ['fe80::31'], allow: ['fe80::7'] });
+        // The main computer probes the port address, and the lender counts as reached there.
+        for (let tries = 0; tries < 60 && !pcApp.probes.includes('fe80::31:50052'); tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(pcApp.probes).toContain('fe80::31:50052');
+        let pools = null;
+        for (let tries = 0; tries < 60; tries += 1) {
+            pools = (await client.get('/api/v1/devices/pools')).data;
+            if (pools.computers.find((one) => one.id === mac.id)?.reachable === true) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(pools.computers.find((one) => one.id === mac.id)).toMatchObject({ role: 'lend', lending: true, reachable: true });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
+        pcApp.ws.close();
+        macApp.ws.close();
+    });
+
+    test('the server checks the connections again by itself when a computer reports another network, and tells its pages', async () => {
+        await testStartup.loginAsUser('admin');
+        const one = await link('recheck-one');
+        const app = await fakeApp(one.id, one.key, { network: { addresses: [{ address: '10.9.9.10', prefix: 24, interface: 'Wi-Fi', wired: false }] } });
+        const service = getNotificationService();
+        const told = [];
+        const real = service.sendToUser.bind(service);
+        service.sendToUser = (userId, notification) => {
+            if (notification.type === 'pools:changed') told.push(String(userId));
+            return real(userId, notification);
+        };
+        setPoolRecheck(40);
+        try {
+            app.ws.send(JSON.stringify({ type: 'network', data: { addresses: [{ address: '10.9.9.11', prefix: 24, interface: 'Wi-Fi', wired: false }] } }));
+            for (let tries = 0; tries < 60 && told.length === 0; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(told.length).toBe(1);
+        } finally {
+            setPoolRecheck(0);
+            service.sendToUser = real;
+            app.ws.close();
+        }
     });
 
     test('the pooling drawing is worked out on the server: cables, routers, every warning with its cause, and where memory runs', () => {
@@ -7241,7 +7322,7 @@ describe('Linked devices', () => {
         expect(apart.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
         // A cable with nobody at the other end and no computer with two cables to blame: check the cable.
         const lone = poolScene({ ...view, computers: view.computers.map((one) => ({ ...one, problems: [] })), checks: { at: new Date(), pairs: [] } });
-        expect(lone.issues.find((issue) => issue.on.computer === 'i9').notes).toEqual([{ level: 'warning', title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: [expect.stringMatching(/^Check that the cable is plugged in at both ends/), 'Then press Check again.'] }]);
+        expect(lone.issues.find((issue) => issue.on.computer === 'i9').notes).toEqual([{ level: 'warning', title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: [expect.stringMatching(/^Check that the cable is plugged in at both ends/)] }]);
         // Before any check, nothing is said about cables, and no memory is drawn.
         const unchecked = poolScene({ ...view, checks: null });
         expect(unchecked.cables).toEqual([]);
