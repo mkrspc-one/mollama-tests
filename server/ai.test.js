@@ -1848,6 +1848,10 @@ describe('Model endpoints', () => {
                 expect(list.models.find((model) => model.tag === 'hf.co/someone/Tiny-Chat-8B-GGUF')).toMatchObject({ source: 'huggingface', hub: 'someone/Tiny-Chat-8B-GGUF', name: 'Tiny-Chat-8B', parameters: 8, sizeEstimated: true, capabilities: ['vision'], fit: { verdict: expect.any(String) } });
                 expect(list.models.find((model) => model.tag === 'hf.co/someone/Tiny-Chat-8B-GGUF').sizeMb).toBe(Math.round(8.03e9 * 0.6 / (1024 * 1024)));
                 expect(list.models.some((model) => /Locked|No-Facts/.test(model.tag))).toBe(false);
+                // With nothing searched or chosen, the best fits lead: fully on the graphics card, then the processor alone, then with system memory's help.
+                const rank = { gpu: 0, cpu: 1, mixed: 2, too_large: 3 };
+                const ranks = list.models.map((model) => rank[model.fit.verdict]);
+                expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
                 // The list stops at 200 and says whether there is more; the next page of Hugging Face is read only when needed.
                 expect(list).toMatchObject({ limit: 200, hubDown: false });
                 expect(list.models.some((model) => model.tag === 'hf.co/someone/Late-3B-GGUF')).toBe(true);
