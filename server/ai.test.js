@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7270,6 +7270,24 @@ describe('Linked devices', () => {
         }
     });
 
+    test('a secondary computer the primary does not reach directly is reached along the shortest route the checks found', () => {
+        const reached = new Map([
+            ['pc|m3', { address: '169.254.30.2' }], ['m3|pc', { address: '169.254.30.1' }],
+            ['m3|i9', { address: 'fe80::9' }], ['i9|m3', { address: 'fe80::31' }],
+            ['i9|mini', { address: '10.254.1.2' }],
+            ['mini|far', { address: '10.254.2.2' }], ['far|edge', { address: '10.254.3.2' }], ['edge|end', { address: '10.254.4.2' }]
+        ]);
+        const computer = (id, role = 'lend') => ({ id, role, online: true, paused: false });
+        const routes = poolRoutes(reached, [computer('pc', 'main'), computer('m3'), computer('i9'), computer('mini'), computer('far', 'off'), computer('edge', 'off'), computer('end')], 'pc');
+        // m3 is reached directly, so it has no route; i9 through m3; mini through m3 and i9, each on its own port.
+        expect(routes.has('m3')).toBe(false);
+        expect(routes.get('i9')).toEqual({ path: ['pc', 'm3', 'i9'], port: 50053, addresses: ['169.254.30.2', 'fe80::9'] });
+        expect(routes.get('mini')).toEqual({ path: ['pc', 'm3', 'i9', 'mini'], port: 50054, addresses: ['169.254.30.2', 'fe80::9', '10.254.1.2'] });
+        // More than three computers in between is too slow to be worth it.
+        expect(routes.has('end')).toBe(false);
+        expect(poolRoutes(reached, [computer('pc', 'main'), computer('i9')], null).size).toBe(0);
+    });
+
     test('the pooling drawing is worked out on the server: cables, routers, every warning with its cause, and where memory runs', () => {
         const yes = (ms) => ({ ok: true, ms, why: null });
         const no = (why) => ({ ok: false, ms: null, why });
@@ -7316,8 +7334,21 @@ describe('Linked devices', () => {
             { a: 'i9', b: 'm3', via: 'cable', verdict: 'works', from: null, there: yes(0.7), back: yes(0.8) }
         ] } });
         const alone = apart.issues.find((issue) => issue.on.computer === 'i9');
-        expect(alone).toMatchObject({ level: 'error', notes: [{ title: 'No connection of its own', text: 'i9 reaches pc only through m3, and a secondary computer needs its own connection to the primary one.' }] });
-        expect(alone.notes[0].steps[0]).toMatch(/^Join i9 and pc with a cable/);
+        expect(alone).toMatchObject({ level: 'error', notes: [{ title: 'Route not working yet', text: 'i9 reaches pc only through m3, which is not passing its memory along yet.' }] });
+        expect(alone.notes[0].steps[0]).toMatch(/^Update the Mollama desktop app to 1\.0\.25 or later on i9, m3 and pc/);
+        // Once the computer in between passes it along: a warning that it is a little slower, and memory runs the whole way.
+        const routed = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'i9' ? { ...one, role: 'lend', lending: true, reachable: true, through: ['m3'] } : { ...one, problems: [] })), checks: apart.checks || { at: new Date(), pairs: [
+            { a: 'm3', b: 'pc', via: 'cable', verdict: 'works', from: null, there: yes(3.6), back: yes(3.9) },
+            { a: 'i9', b: 'm3', via: 'cable', verdict: 'works', from: null, there: yes(0.7), back: yes(0.8) }
+        ] } });
+        expect(routed.issues.find((issue) => issue.on.computer === 'i9')).toMatchObject({ level: 'warning', notes: [{ title: 'Through another computer', text: 'pc reaches i9 through m3, a little slower than a cable of its own.' }] });
+        expect(routed.flows).toContainEqual({ from: 'i9', to: 'pc', hops: ['i9', 'm3', 'pc'] });
+        // Over Wi-Fi: it works, slower and less steady than a cable.
+        const overWifi = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, problems: [], over: 'wifi' } : one)) });
+        expect(overWifi.issues.find((issue) => issue.on.computer === 'm3').notes).toContainEqual(expect.objectContaining({ level: 'warning', title: 'Pooled over Wi-Fi' }));
+        // A computer still asking its person whether to set pooling up says so with a mark.
+        const asking = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, problems: [], setup: 'asking', reachable: null } : one)) });
+        expect(asking.issues.find((issue) => issue.on.computer === 'm3').notes).toContainEqual(expect.objectContaining({ title: 'Waiting on m3' }));
         expect(JSON.stringify(apart.issues)).not.toMatch(/firewall/i);
         expect(apart.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
         // A cable with nobody at the other end and no computer with two cables to blame: check the cable.
