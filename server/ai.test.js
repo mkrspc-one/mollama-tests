@@ -7132,6 +7132,17 @@ describe('Linked devices', () => {
         // Another home with the same private addresses is not the same network.
         expect(Object.fromEntries(left.map((one) => [one.id, one.reason]))).toEqual({ away: 'alone', cafe: 'public', asleep: 'offline', resting: 'paused', old: 'update' });
         expect(left.find((one) => one.id === 'cafe').message).toMatch(/Public/);
+
+        // A chain of two bare cables (a Mac on Thunderbolt to another Mac, and by Ethernet to a PC): every cable is
+        // 169.254.0.0/16, so the Mac in the middle has two addresses in one group, and is listed once with both.
+        const chain = poolGroups([
+            pc('i9', '1.1.1.1', [{ address: '169.254.10.1', prefix: 16, wired: true }]),
+            pc('m3', '1.1.1.1', [{ address: '169.254.10.2', prefix: 16, wired: true }, { address: '169.254.20.2', prefix: 16, wired: true }]),
+            pc('pc', '1.1.1.1', [{ address: '169.254.20.1', prefix: 16, wired: true }])
+        ]).groups;
+        expect(chain).toHaveLength(1);
+        expect(chain[0].computers.map((one) => [one.id, one.addresses])).toEqual([['i9', ['169.254.10.1']], ['m3', ['169.254.10.2', '169.254.20.2']], ['pc', ['169.254.20.1']]]);
+        expect(chain[0].combined).toEqual({ gpuMemoryMb: 3 * 8192, memoryMb: 3 * 32768 });
     });
 
     test('lessons are read from lines of JSON or from plain text, and what is wrong with them is said plainly', () => {
