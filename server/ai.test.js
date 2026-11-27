@@ -7325,9 +7325,13 @@ describe('Linked devices', () => {
         expect(scene.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
 
         // A secondary computer the primary cannot reach: a warning on it, and no memory drawn running.
-        const unreached = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, reachable: false, detail: 'The gate did not answer.' } : one)) });
+        const unreached = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, reachable: false, detail: 'Nothing answered within 4 seconds.', tried: [{ address: '169.254.30.2', reachable: false, detail: 'Nothing answered within 4 seconds.' }, { address: 'fe80::31', reachable: false, detail: 'Nothing answered within 4 seconds.' }] } : one)) });
         expect(unreached.flows).toEqual([]);
-        expect(unreached.issues.find((issue) => issue.on.computer === 'm3')).toMatchObject({ level: 'error', notes: expect.arrayContaining([expect.objectContaining({ title: 'Primary cannot reach it', text: 'The gate did not answer.' })]) });
+        // Every address the primary computer tried is listed with what came back, not only the last answer.
+        expect(unreached.issues.find((issue) => issue.on.computer === 'm3').notes).toContainEqual({ level: 'error', title: 'Primary cannot reach it', text: 'pc, the primary computer, tried 2 ways to m3 and none answered.', steps: ['169.254.30.2 (cable): Nothing answered within 4 seconds.', 'fe80::31 (cable port address): Nothing answered within 4 seconds.'] });
+        // A Mac not allowed onto the local network is named as the cause whichever address said so.
+        const notAllowed = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, reachable: false, tried: [{ address: '169.254.30.2', reachable: false, detail: 'This Mac is not allowed to reach computers on your network yet.' }, { address: 'fe80::31', reachable: false, detail: 'Nothing answered within 4 seconds.' }] } : one)) });
+        expect(notAllowed.issues.find((issue) => issue.on.computer === 'm3').notes).toContainEqual(expect.objectContaining({ text: 'pc is not allowed onto your local network yet, so it cannot reach m3.' }));
         // A secondary computer joined to the primary only through another computer: said plainly, never a firewall guess.
         const apart = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'i9' ? { ...one, role: 'lend', lending: true, reachable: false, detail: 'Nothing answered. A firewall on it is probably blocking Mollama.' } : { ...one, problems: [] })), checks: { at: new Date(), pairs: [
             { a: 'm3', b: 'pc', via: 'cable', verdict: 'works', from: null, there: yes(3.6), back: yes(3.9) },
