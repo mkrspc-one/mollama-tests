@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -6153,6 +6153,11 @@ describe('Chat endpoints', () => {
                 expect(promisedOnly('The motor turns the rear wheel. Let me know if you want more.')).toBe(false);
                 expect(promisedOnly('Here it is.\n```component\n<Badge>Done</Badge>\n```\nI will add more if you ask.')).toBe(false);
                 expect(promisedOnly(`${'An answer. '.repeat(400)}I will go on.`)).toBe(false);
+                // A greeting or a question back is no promise of work, so it is never sent back to be done.
+                expect(promisedOnly('Hello! I\'m here to help. What would you like to work on today?')).toBe(false);
+                expect(promisedOnly('Hi there! I will do my best to help with anything you need.')).toBe(false);
+                expect(promisedOnly('Sure. I\'ll draw it as a flow chart, or would you rather have a table?')).toBe(false);
+                expect(promisedOnly('Sure, let me search the web for the latest version.')).toBe(true);
             });
 
             test('a model that calls functions itself is given the request again after a skill page, in what is sent only', () => {
@@ -7268,6 +7273,12 @@ describe('Linked devices', () => {
             service.sendToUser = real;
             app.ws.close();
         }
+    });
+
+    test('a lending computer may open its gate on any private address: a home network of any range, a cable, or a cable port', () => {
+        // 192.168 is most homes' range and 169.254 every bare cable's: both were once dropped, so lenders there were never probed.
+        expect(['192.168.1.20', '169.254.114.140', '172.16.0.5', '10.0.0.135', '10.254.1.2', 'fe80::d6d6:6018:4744:a713'].every(gateAddress)).toBe(true);
+        expect(['8.8.8.8', '100.64.0.1', '192.169.0.1', 'fe80::1%en9', '169.254.1', 'example.com'].some(gateAddress)).toBe(false);
     });
 
     test('a secondary computer the primary does not reach directly is reached along the shortest route the checks found', () => {
