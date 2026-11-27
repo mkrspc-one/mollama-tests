@@ -7167,29 +7167,37 @@ describe('Linked devices', () => {
         expect(connectionProblems(undefined, 'darwin')).toEqual([]);
     });
 
-    test('the checks between computers come back as one line per pair and way, both directions', () => {
-        const names = new Map([['i9', 'zero i9'], ['m3', 'Zero M3'], ['pc', 'zero-pc']]);
+    test('the checks between computers come back as one entry per pair and way, judged by what a pool needs', () => {
+        const known = new Set(['i9', 'm3', 'pc']);
         const at = new Date();
-        const summary = linkSummary({ at, results: [
+        const results = [
             // The Mac in the middle has an address on each cable; only the one on the cable to the other Mac answers it.
-            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.20.2', ok: false, why: 'silent' },
-            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.10.2', ok: true, ms: 0.6 },
+            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.20.2', ok: false, why: 'EHOSTUNREACH' },
+            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.10.2', ok: false, why: 'EHOSTUNREACH' },
             { from: 'm3', to: 'i9', via: 'cable', address: '169.254.10.1', ok: true, ms: 0.7 },
             { from: 'm3', to: 'pc', via: 'cable', address: '169.254.30.1', ok: true, ms: 0.9 },
-            { from: 'pc', to: 'm3', via: 'cable', address: '169.254.30.2', ok: false, why: 'silent' },
+            { from: 'pc', to: 'm3', via: 'cable', address: '169.254.30.2', ok: true, ms: 1.1 },
+            // zero i9 and zero-pc each have a cable to Zero M3, none between them.
+            { from: 'i9', to: 'pc', via: 'cable', address: '169.254.30.2', ok: false, why: 'EHOSTUNREACH' },
+            { from: 'pc', to: 'i9', via: 'cable', address: '169.254.10.1', ok: false, why: 'EHOSTUNREACH' },
             { from: 'i9', to: 'm3', via: 'wifi', address: '10.0.0.66', ok: null, why: 'update' },
-            { from: 'm3', to: 'i9', via: 'wifi', address: '10.0.0.231', ok: null, why: 'update' }
-        ] }, names);
+            { from: 'm3', to: 'i9', via: 'wifi', address: '10.0.0.231', ok: null, why: 'update' },
+            // A computer since removed from the account is never shown.
+            { from: 'gone', to: 'm3', via: 'cable', address: '169.254.30.1', ok: true, ms: 2 }
+        ];
+        const pairs = (main) => linkSummary({ at, results }, known, main).pairs.map((pair) => [pair.a, pair.b, pair.via, pair.verdict, pair.from]);
+        expect(pairs(null)).toEqual([['i9', 'm3', 'cable', 'oneway', 'm3'], ['m3', 'pc', 'cable', 'works', null], ['i9', 'm3', 'wifi', 'unknown', null]]);
+        expect(pairs('m3').slice(0, 2)).toEqual([['i9', 'm3', 'cable', 'enough', 'm3'], ['m3', 'pc', 'cable', 'works', null]]);
+        expect(pairs('i9')[0]).toEqual(['i9', 'm3', 'cable', 'blocked', 'm3']);
+        const summary = linkSummary({ at, results }, known, 'm3');
         expect(summary.at).toBe(at);
-        expect(summary.pairs.map((pair) => [pair.aName, pair.bName, pair.via, pair.there.ok, pair.back?.ok])).toEqual([
-            ['zero i9', 'Zero M3', 'cable', true, true],
-            ['Zero M3', 'zero-pc', 'cable', true, false],
-            ['zero i9', 'Zero M3', 'wifi', null, null]
-        ]);
-        expect(summary.pairs[0].there.ms).toBe(0.6);
-        expect(summary.pairs[1].back.why).toMatch(/firewall/);
+        expect(summary.pairs[0].there).toEqual({ ok: false, ms: null, why: expect.stringMatching(/Local Network/) });
+        expect(summary.pairs[0].back).toEqual({ ok: true, ms: 0.7, why: null });
         expect(summary.pairs[2].there.why).toMatch(/^Update the Mollama desktop app/);
-        expect(linkSummary(null, names)).toBeNull();
+        // On a home network a pair that never answers is a problem, not a missing cable.
+        const home = linkSummary({ at, results: [{ from: 'i9', to: 'm3', via: 'wifi', ok: false, why: 'silent' }, { from: 'm3', to: 'i9', via: 'wifi', ok: false, why: 'silent' }] }, known, null);
+        expect(home.pairs).toEqual([expect.objectContaining({ verdict: 'blocked', there: expect.objectContaining({ why: expect.stringMatching(/firewall/) }) })]);
+        expect(linkSummary(null, known)).toBeNull();
     });
 
     test('lessons are read from lines of JSON or from plain text, and what is wrong with them is said plainly', () => {
@@ -7564,17 +7572,19 @@ describe('Linked devices', () => {
         let pools = null;
         for (let tries = 0; tries < 60; tries += 1) {
             pools = (await client.get('/api/v1/devices/pools')).data;
-            if (pools.groups.some((group) => group.network === '10.9.0.0/24' && group.computers.length === 2)) break;
+            if (pools.networks.some((group) => group.network === '10.9.0.0/24' && group.computers.length === 2)) break;
             await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        const group = pools.groups.find((one) => one.network === '10.9.0.0/24');
+        const group = pools.networks.find((one) => one.network === '10.9.0.0/24');
         expect(group.computers.map((one) => one.address).sort()).toEqual(['10.9.0.10', '10.9.0.20']);
         expect(group).toMatchObject({ via: 'home', wired: false });
         expect(group.combined.memoryMb).toBe(65536);
-        const reason = (id) => pools.left.find((one) => one.id === id)?.reason;
+        const reason = (id) => pools.computers.find((one) => one.id === id)?.reason;
         expect([reason(cafe.id), reason(old.id), reason(asleep.id)]).toEqual(['public', 'update', 'offline']);
         // The public address each link came from is never sent to the page.
         expect(JSON.stringify(pools)).not.toMatch(/publicAddress|127\.0\.0\.1|::1/);
+        // Every computer is drawn as a kind of computer; without the desktop app saying, a computer with no graphics card of its own is a laptop.
+        expect(pools.computers.find((one) => one.id === cafe.id)).toMatchObject({ form: 'laptop', cables: [] });
 
         // Another person sees none of these computers.
         await testStartup.loginAsUser('user');
@@ -7603,8 +7613,8 @@ describe('Linked devices', () => {
         const mac = await link('lend-mac');
         const pcApp = await fakeApp(pc.id, pc.key, { network: home('10.9.1.10') });
         const macApp = await fakeApp(mac.id, mac.key, { network: home('10.9.1.20') });
-        const groupOf = (pools) => pools.groups.find((group) => group.network === '10.9.1.0/24');
-        const partOf = (pools, id) => groupOf(pools)?.computers.find((one) => one.id === id);
+        const groupOf = (pools) => pools.networks.find((group) => group.network === '10.9.1.0/24');
+        const partOf = (pools, id) => (groupOf(pools)?.computers.some((one) => one.id === id) ? pools.computers.find((one) => one.id === id) : undefined);
         await until((pools) => groupOf(pools)?.computers.length === 2);
         // Computers that never pooled are told nothing.
         expect([pcApp.orders, macApp.orders]).toEqual([[], []]);
@@ -7636,10 +7646,10 @@ describe('Linked devices', () => {
         await testStartup.loginAsUser('admin');
         expect((await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'boss' })).status).toBe(400);
 
-        // A person has one main computer: choosing another sets the first one off, and lending stops.
+        // A person has one main computer: choosing another makes the first one lend to it, so the two swap.
         await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'main' });
-        expect(await ordered(pcApp, { role: 'off', bind: null, allow: [] })).toEqual({ role: 'off', bind: null, allow: [] });
-        pools = await until((found) => found.main === mac.id && partOf(found, pc.id)?.role === 'off');
+        expect(await ordered(pcApp, { role: 'lend', bind: '10.9.1.10', allow: ['10.9.1.20'] })).toEqual({ role: 'lend', bind: '10.9.1.10', allow: ['10.9.1.20'] });
+        pools = await until((found) => found.main === mac.id && partOf(found, pc.id)?.role === 'lend');
         expect(partOf(pools, mac.id)).toMatchObject({ role: 'main', lending: false });
 
         // When the main computer goes offline, the lender shuts its gate.
@@ -7674,7 +7684,7 @@ describe('Linked devices', () => {
         await fakeApp(pc.id, pc.key, { network: home('10.9.7.10') });
         await fakeApp(mac.id, mac.key, { network: home('10.9.7.20') });
         for (let tries = 0; tries < 60; tries += 1) {
-            if ((await client.get('/api/v1/devices/pools')).data.groups.some((group) => group.network === '10.9.7.0/24' && group.computers.length === 2)) break;
+            if ((await client.get('/api/v1/devices/pools')).data.networks.some((group) => group.network === '10.9.7.0/24' && group.computers.length === 2)) break;
             await new Promise((resolve) => setTimeout(resolve, 50));
         }
         const pooledIn = async (id) => (await client.get(`/api/v1/devices/${id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
@@ -7699,19 +7709,19 @@ describe('Linked devices', () => {
             let pools = null;
             for (let tries = 0; tries < 80; tries += 1) {
                 pools = (await client.get('/api/v1/devices/pools')).data;
-                if (Boolean(pools.groups.find((group) => group.network === '10.9.8.0/24')) === want) break;
+                if (Boolean(pools.networks.find((group) => group.network === '10.9.8.0/24')) === want) break;
                 await new Promise((resolve) => setTimeout(resolve, 50));
             }
             return pools;
         };
-        expect((await groupNow(true)).groups.some((group) => group.network === '10.9.8.0/24')).toBe(true);
+        expect((await groupNow(true)).networks.some((group) => group.network === '10.9.8.0/24')).toBe(true);
         await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'main' });
         await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'lend' });
 
         // The Mac's network becomes Public: the pool goes, and the Mac is listed with the connection to set Private.
         macApp.ws.send(JSON.stringify({ type: 'network', data: home('10.9.8.20', { category: 'public' }) }));
         const apart = await groupNow(false);
-        expect(apart.left.find((one) => one.id === mac.id)).toMatchObject({ reason: 'public', publicNetworks: ['A9000_NETGEAR'] });
+        expect(apart.computers.find((one) => one.id === mac.id)).toMatchObject({ reason: 'public', publicNetworks: ['A9000_NETGEAR'] });
         // A model that fits only pooled still says so, with the pool off and why.
         const off = (await client.get(`/api/v1/devices/${pc.id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
         expect(off.length).toBeGreaterThan(0);
@@ -7748,7 +7758,7 @@ describe('Linked devices', () => {
         let part = null;
         for (let tries = 0; tries < 60 && !part?.detail; tries += 1) {
             const pools = (await client.get('/api/v1/devices/pools')).data;
-            part = pools.groups.find((group) => group.network === '10.9.2.0/24')?.computers.find((one) => one.id === helper.id);
+            part = pools.networks.some((group) => group.network === '10.9.2.0/24') ? pools.computers.find((one) => one.id === helper.id) : null;
             if (!part?.detail) await new Promise((resolve) => setTimeout(resolve, 50));
         }
         expect(part.detail).toMatch(/pools a different way/);
@@ -7919,9 +7929,9 @@ describe('Linked devices', () => {
         const two = await link('check-two');
         await fakeApp(one.id, one.key, { network: home('10.9.5.10') });
         const twoApp = await fakeApp(two.id, two.key, { network: home('10.9.6.20') });
-        const sharing = (pools) => pools.groups.some((group) => group.computers.some((c) => c.id === one.id) && group.computers.some((c) => c.id === two.id));
+        const sharing = (pools) => pools.networks.some((group) => group.computers.some((c) => c.id === one.id) && group.computers.some((c) => c.id === two.id));
         let pools = (await client.get('/api/v1/devices/pools')).data;
-        for (let tries = 0; tries < 40 && pools.left.every((c) => c.id !== two.id); tries += 1) pools = (await client.get('/api/v1/devices/pools')).data;
+        for (let tries = 0; tries < 40 && pools.computers.every((c) => c.id !== two.id || !c.reason); tries += 1) pools = (await client.get('/api/v1/devices/pools')).data;
         expect(sharing(pools)).toBe(false);
         // The second computer joins the first one's network; nothing is seen until it is read again.
         twoApp.network = home('10.9.5.20');
@@ -7929,7 +7939,7 @@ describe('Linked devices', () => {
         const checked = (await client.post('/api/v1/devices/pools/check', {})).data;
         expect(checked.checkedAt).toBeTruthy();
         expect(sharing(checked)).toBe(true);
-        expect(checked.groups.find((group) => group.network === '10.9.5.0/24').computers.map((c) => c.address).sort()).toEqual(['10.9.5.10', '10.9.5.20']);
+        expect(checked.networks.find((group) => group.network === '10.9.5.0/24').computers.map((c) => c.address).sort()).toEqual(['10.9.5.10', '10.9.5.20']);
     });
 
     test('a hello that cannot be checked just now asks the app to try again instead of forgetting its link', async () => {
