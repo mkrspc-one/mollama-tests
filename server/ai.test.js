@@ -27,7 +27,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -6135,6 +6135,24 @@ describe('Chat endpoints', () => {
                 } finally {
                     setPermissionWait(null);
                 }
+            });
+
+            test('a skill named by part of its name is found when only one fits', () => {
+                const list = [{ id: 'hairline-hairline-create', name: 'Hairline Create' }, { id: 'anatomy-anatomy', name: 'Anatomy' }, { id: 'cadsmith-make-model', name: 'CadSmith Make Model' }, { id: 'cadsmith-make-mechanism', name: 'CadSmith Make Mechanism' }];
+                expect(nearSkill(list, 'hairline')?.id).toBe('hairline-hairline-create');
+                expect(nearSkill(list, 'Anatomy')?.id).toBe('anatomy-anatomy');
+                expect(nearSkill(list, 'make model')?.id).toBe('cadsmith-make-model');
+                expect(nearSkill(list, 'cadsmith')).toBeNull();
+                expect(nearSkill(list, 'ab')).toBeNull();
+                expect(nearSkill(list, '')).toBeNull();
+            });
+
+            test('a short reply that only says what it will do is told to do it, and an answer is not', () => {
+                expect(promisedOnly('I will create a detailed figure of an electric bicycle. The figure will be interactive.')).toBe(true);
+                expect(promisedOnly('Let me open both skills first, then build three figures.\n\n```skill-map\n<anatomy-anatomy>\n</anatomy-anatomy>\n```')).toBe(true);
+                expect(promisedOnly('The motor turns the rear wheel. Let me know if you want more.')).toBe(false);
+                expect(promisedOnly('Here it is.\n```component\n<Badge>Done</Badge>\n```\nI will add more if you ask.')).toBe(false);
+                expect(promisedOnly(`${'An answer. '.repeat(400)}I will go on.`)).toBe(false);
             });
 
             test('a model that calls functions itself is given the request again after a skill page, in what is sent only', () => {
