@@ -14,7 +14,7 @@ import { Server } from '../../server/server.js';
 import { Rental } from '../../server/models/ai.model.js';
 import { setHyperstackFetch, setRunpodFetch, machinePrefix } from '../../server/middleware/ai.middleware.js';
 import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
-import { rentalsOn, rentalsSafeHere, cardKey, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
+import { RENTAL_RULES, rentalsOn, rentalsSafeHere, cardKey, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
@@ -4748,7 +4748,7 @@ describe('Chat endpoints', () => {
             }
             // Mollama's own skills: the one that draws its viewers and the map of what each skill is for.
             expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components', 'skill-map']);
-            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer', 'cadsmith']);
+            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer', 'cadsmith', 'caveman']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
@@ -8628,7 +8628,7 @@ describe('Linked devices', () => {
         const clear = async () => {
             Object.assign(hs, { refuseDelete: false, failCreate: null, down: false, credit: 50, canCreate: true });
             for (const rental of await Rental.find({ state: { $ne: 'ended' } })) {
-                await settle(rental.user, `rental:${rental.id}`, 0, 'Cleared between tests').catch(() => {});
+                for (const hold of [`rental:${rental.id}`, ...(rental.extended || []).filter((one) => one.hold).map((one) => one.hold)]) await settle(rental.user, hold, 0, 'Cleared between tests').catch(() => {});
                 await Rental.updateOne({ _id: rental._id }, { $set: { state: 'ended', endedAt: new Date() }, $unset: { slot: 1 } });
             }
             await Device.deleteMany({ rental: { $ne: null } });
@@ -8863,7 +8863,7 @@ describe('Linked devices', () => {
             await testStartup.loginAsUser('admin');
             await credit(testStartup.admin.id, 2000);
             const response = await client.get('/api/v1/rentals/cards');
-            expect(response.data).toMatchObject({ on: true, balance: 2000, rules: { limit: 1000, hours: 2, idleMinutes: 30, atOnce: 1 } });
+            expect(response.data).toMatchObject({ on: true, balance: 2000, rules: { limit: 1000, hours: 2, idleMinutes: 30, atOnce: 4, longestHours: 24 } });
             // Spot machines in stock are offered too, marked as such.
             // Cards are named by kind, never by a provider's own name for them.
             expect(response.data.cards.map((card) => card.flavor)).toEqual(['l40-48x1', 'l40-48x1-spot', 'h100-80x1']);
@@ -8919,16 +8919,71 @@ describe('Linked devices', () => {
             expect(listed).toMatchObject({ online: false, rental: response.data.rental.id });
         });
 
-        test('one machine at a time, also when asked for twice at the same moment', async () => {
-            await credit(testStartup.admin.id, 5000);
-            await testStartup.loginAsUser('admin');
-            const both = await Promise.all([client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any), client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)]);
-            expect(both.map((response) => response.status).sort()).toEqual([201, 409]);
-            const third = await client.post('/api/v1/rentals', { flavor: 'n3-H100x1' }, any);
-            expect(third.status).toBe(409);
-            expect(third.data.code).toBe('ALREADY_RENTING');
-            expect(hs.machines.size).toBe(1);
-            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 4000, held: 1000 });
+        test('no more machines at once than the rule allows, also when asked for twice at the same moment', async () => {
+            const usual = RENTAL_RULES.atOnce;
+            RENTAL_RULES.atOnce = 1;
+            try {
+                await credit(testStartup.admin.id, 5000);
+                await testStartup.loginAsUser('admin');
+                const both = await Promise.all([client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any), client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)]);
+                expect(both.map((response) => response.status).sort()).toEqual([201, 409]);
+                const third = await client.post('/api/v1/rentals', { flavor: 'n3-H100x1' }, any);
+                expect(third.status).toBe(409);
+                expect(third.data).toMatchObject({ code: 'ALREADY_RENTING', message: 'You already have a rented computer. End it before renting another.' });
+                expect(hs.machines.size).toBe(1);
+                expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 4000, held: 1000 });
+            } finally {
+                RENTAL_RULES.atOnce = usual;
+            }
+        });
+
+        test('several machines at once up to the rule, each with its own limit set aside', async () => {
+            const usual = RENTAL_RULES.atOnce;
+            RENTAL_RULES.atOnce = 2;
+            try {
+                await credit(testStartup.admin.id, 5000);
+                await testStartup.loginAsUser('admin');
+                const both = await Promise.all([client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any), client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any)]);
+                expect(both.map((response) => response.status)).toEqual([201, 201]);
+                const third = await client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any);
+                expect(third.data).toMatchObject({ code: 'ALREADY_RENTING', message: 'You already have 2 rented computers, the most at once. End one before renting another.' });
+                expect(hs.machines.size).toBe(2);
+                expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 3000, held: 2000 });
+                expect((await client.get('/api/v1/rentals')).data.rentals.filter((rental) => rental.state !== 'ended')).toHaveLength(2);
+            } finally {
+                RENTAL_RULES.atOnce = usual;
+            }
+        });
+
+        test('a rental can be extended: the limit rises only when it would not cover the longer time, and every hold is settled at the end', async () => {
+            const { rental } = (await rent()).data;
+            await linked(rental);
+            expect(rental.moreHours).toBe(12);
+            // An hour more is still inside the $10 limit, so nothing more is set aside.
+            const hour = await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 1 }, any);
+            expect(hour.status).toBe(200);
+            expect(hour.data.rental).toMatchObject({ minutes: 180, limit: 1000, moreHours: 12 });
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1000, held: 1000 });
+            // Ten hours more would pass it: the difference is set aside as a hold of its own.
+            const extra = Math.ceil(780 * L40_PRICE / 60) - 1000;
+            const ten = await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 10 }, any);
+            expect(ten.data.rental).toMatchObject({ minutes: 780, limit: 1000 + extra, moreHours: 11 });
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 1000 - extra, held: 1000 + extra });
+            // Never past the longest a rental may run, and never more hours at once than the form offers.
+            expect((await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 12 }, any)).data.code).toBe('TOO_LONG');
+            expect((await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 13 }, any)).status).toBe(400);
+            // Not enough credit for the next step up: refused, nothing set aside.
+            await charge(testStartup.admin.id, 1000 - extra, { about: 'For a rental test' });
+            expect((await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 8 }, any)).data.code).toBe('NOT_ENOUGH_CREDIT');
+            await addCredit(testStartup.admin.id, 1000 - extra, { about: 'For a rental test' });
+
+            await Rental.updateOne({ _id: rental.id }, { readyAt: back(65) });
+            expect((await client.post(`/api/v1/rentals/${rental.id}/end`, {}, any)).status).toBe(200);
+            await watchRentals();
+            const ended = await Rental.findById(rental.id);
+            expect(ended.state).toBe('ended');
+            expect(await balanceOf(testStartup.admin.id)).toEqual({ balance: 2000 - ended.spent, held: 0 });
+            expect((await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 1 }, any)).data.code).toBe('RENTAL_ENDING');
         });
 
         test('a rented computer is its person\'s alone, and is never part of a pool', async () => {
