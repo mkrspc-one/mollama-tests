@@ -16,7 +16,7 @@ import { setHyperstackFetch, setRunpodFetch, machinePrefix } from '../../server/
 import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
 import { RENTAL_RULES, rentalsOn, rentalsSafeHere, cardKey, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
-import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
+import { ROLES, RIGHTS, hasRight, RIGHT_ASSIGNMENT } from '../../server/config/rights.js';
 import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, createCloudClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
@@ -8879,6 +8879,12 @@ describe('Linked devices', () => {
 
     // Stage 5G. Hyperstack and Stripe are stand-ins here: no machine is rented and no request leaves this computer.
     describe('Rented computers', () => {
+        // The rentals tests below run with every role given the right to rent; keeping it to admins has a test of its own.
+        const OTHERS = [ROLES.SUPER_CREATOR, ROLES.CREATOR, ROLES.USER];
+        const openRenting = () => OTHERS.forEach((role) => { if (!RIGHT_ASSIGNMENT[role].includes(RIGHTS.RENT_COMPUTERS)) RIGHT_ASSIGNMENT[role].push(RIGHTS.RENT_COMPUTERS); });
+        const closeRenting = () => OTHERS.forEach((role) => { RIGHT_ASSIGNMENT[role] = RIGHT_ASSIGNMENT[role].filter((right) => right !== RIGHTS.RENT_COMPUTERS); });
+        beforeAll(openRenting);
+        afterAll(closeRenting);
         const SETTINGS = { HYPERSTACK_API_KEY: 'hs_test_standin', HYPERSTACK_ENVIRONMENT: 'mollama-test', HYPERSTACK_KEY_NAME: 'mollama-key', RENTAL_SERVER_URL: 'https://server.mollama.test', RENTAL_LABEL: 'Test' };
         const L40_PRICE = 131;
         const hs = { machines: new Map(), calls: [], next: 7000, credit: 50, canCreate: true, refuseDelete: false, failCreate: null, down: false, bills: new Map() };
@@ -9157,10 +9163,35 @@ describe('Linked devices', () => {
             }
         });
 
+        test('renting is App Base\'s RENT_COMPUTERS right, held by admins and owners: nobody else is shown it or may start one, and test money is then safe', async () => {
+            const was = { NODE_ENV: process.env.NODE_ENV, ADMIN_ONLY: process.env.ADMIN_ONLY };
+            const put = (values) => Object.entries(values).forEach(([name, value]) => (value === undefined ? delete process.env[name] : (process.env[name] = value)));
+            closeRenting();
+            expect([ROLES.OWNER, ROLES.ADMIN, ROLES.SUPER_CREATOR, ROLES.CREATOR, ROLES.USER].map((role) => hasRight([role], RIGHTS.RENT_COMPUTERS))).toEqual([true, true, false, false, false]);
+            try {
+                // Outside the suite, with test money and no ADMIN_ONLY, renting is still safe, since only admins may rent.
+                put({ NODE_ENV: 'development', ADMIN_ONLY: undefined });
+                expect(rentalsSafeHere()).toBe(true);
+                put(was);
+                await testStartup.loginAsUser('user');
+                expect((await client.get('/api/v1/rentals/cards')).data).toEqual({ success: true, on: false });
+                expect((await client.get('/api/v1/rentals')).data).toEqual({ success: true, on: false, rentals: [] });
+                const refused = await client.post('/api/v1/rentals', { flavor: 'n3-L40x1' }, any);
+                expect([refused.status, refused.data.code]).toEqual([404, 'RENTALS_OFF']);
+                await testStartup.loginAsUser('admin');
+                expect((await client.get('/api/v1/rentals/cards')).data.on).toBe(true);
+            } finally {
+                put(was);
+                openRenting();
+            }
+            expect(hs.calls.filter((call) => call.method !== 'GET')).toEqual([]);
+        });
+
         test('with test money, renting is on only where ADMIN_ONLY keeps the public out', async () => {
             const was = { NODE_ENV: process.env.NODE_ENV, ADMIN_ONLY: process.env.ADMIN_ONLY, STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY };
             const put = (values) => Object.entries(values).forEach(([name, value]) => (value === undefined ? delete process.env[name] : (process.env[name] = value)));
             try {
+                // Ordinary users hold the right in these tests, so test money is unsafe outside the suite without ADMIN_ONLY.
                 put({ NODE_ENV: 'development', ADMIN_ONLY: undefined });
                 expect(rentalsSafeHere()).toBe(false);
                 expect(rentalsOn()).toBe(false);
