@@ -9261,7 +9261,10 @@ describe('Linked devices', () => {
             expect((await client.put(`/api/v1/devices/${rental.device}/pool`, { role: 'lend' })).data.code).toBe('RENTED_NOT_POOLED');
             expect((await client.put(`/api/v1/devices/${rental.device}/pool`, { role: 'main' })).status).toBe(400);
             const pools = (await client.get('/api/v1/devices/pools')).data;
-            expect(JSON.stringify(pools)).not.toContain(rental.device);
+            // It stands in the drawing apart, with why it cannot pool, and is in no group, check or warning.
+            expect(pools.computers.find((one) => one.id === rental.device)).toMatchObject({ reason: 'rented', form: 'server', role: 'off', message: expect.stringMatching(/^A rented computer runs models on its own and cannot pool with your computers/) });
+            expect(JSON.stringify(pools.networks)).not.toContain(rental.device);
+            expect(JSON.stringify(pools.scene.issues)).not.toContain(rental.device);
 
             await testStartup.loginAsUser('creator');
             expect((await client.get('/api/v1/rentals')).data.rentals).toEqual([]);
