@@ -7299,6 +7299,43 @@ describe('Linked devices', () => {
         expect(poolRoutes(reached, [computer('pc', 'main'), computer('i9')], null).size).toBe(0);
     });
 
+    test('when only one way works the likely cause is named with what to do: a Mac held back by macOS, or Windows\' firewall', () => {
+        const yes = (ms) => ({ ok: true, ms, why: null });
+        const no = (why) => ({ ok: false, ms: null, why });
+        const computer = (id, name, platform, extra = {}) => ({ id, name, platform, online: true, role: 'off', known: true, lending: false, reachable: null, problems: [], cables: [], homes: [], reason: null, publicNetworks: [], ...extra });
+        // Zero M3 is the primary computer and a Mac: zero-pc reaches it, but it cannot reach zero-pc.
+        const scene = poolScene({
+            main: 'm3',
+            computers: [computer('m3', 'Zero M3', 'darwin', { role: 'main' }), computer('pc', 'zero-pc', 'win32', { role: 'lend', lending: true, reachable: false, tried: [{ address: 'fe80::7', reachable: false, detail: 'Nothing answered within 4 seconds.' }] })],
+            networks: [{ network: 'fe80::/64', via: 'cable', computers: [{ id: 'm3' }, { id: 'pc' }] }],
+            checks: { at: new Date(), pairs: [{ a: 'm3', b: 'pc', via: 'cable', verdict: 'blocked', from: 'pc', there: no('silent'), back: yes(1.2) }] }
+        });
+        const onCable = scene.issues.find((issue) => issue.on.cable);
+        expect(onCable.notes[0]).toMatchObject({ level: 'error', title: 'Zero M3 is not allowed to reach your computers', text: expect.stringMatching(/macOS is holding back Mollama's connections/) });
+        expect(onCable.notes[0].steps).toEqual([expect.stringMatching(/^On Zero M3, open System Settings, Privacy & Security, Local Network/), expect.stringMatching(/^Quit Mollama fully/), 'If it still cannot reach it, restart Zero M3.']);
+        // The secondary computer's own mark says the same, with what the primary computer tried, never only "nothing answered".
+        const onPc = scene.issues.find((issue) => issue.on.computer === 'pc');
+        expect(onPc.notes[0]).toMatchObject({ title: 'Zero M3 is not allowed to reach your computers' });
+        expect(onPc.notes[0].steps.at(-1)).toMatch(/^What Zero M3 tried: fe80::7 \(cable port address\)/);
+        // A Windows computer that nothing reaches, though it reaches out: its firewall, with the steps.
+        const windows = poolScene({
+            main: 'i9',
+            computers: [computer('i9', 'zero i9', 'linux', { role: 'main' }), computer('pc', 'zero-pc', 'win32')],
+            networks: [],
+            checks: { at: new Date(), pairs: [{ a: 'i9', b: 'pc', via: 'wifi', verdict: 'blocked', from: 'pc', there: no('silent'), back: yes(3) }] }
+        });
+        expect(windows.issues[0].notes[0]).toMatchObject({ title: "zero-pc's firewall is blocking Mollama", steps: [expect.stringMatching(/Allow an app through firewall/), expect.stringMatching(/tick both Private and Public/), expect.any(String)] });
+        // A cable with no answer either way and a Mac on it: the Mac's permission is named on both computers, not a bare "no answer".
+        const silent = poolScene({
+            main: 'm3',
+            computers: [computer('m3', 'Zero M3', 'darwin', { role: 'main' }), computer('pc', 'zero-pc', 'win32', { role: 'lend' })],
+            networks: [{ network: 'fe80::/64', via: 'cable', computers: [{ id: 'm3' }, { id: 'pc' }] }],
+            checks: { at: new Date(), pairs: [] }
+        });
+        expect(silent.issues.find((issue) => issue.on.computer === 'm3').notes[0]).toMatchObject({ title: 'Zero M3 may be held back by macOS', steps: [expect.stringMatching(/^On Zero M3, open System Settings, Privacy & Security, Local Network/), expect.any(String), expect.stringMatching(/^Unplug the cable at both ends and plug it back in/), 'If nothing changes, restart Zero M3.'] });
+        expect(silent.issues.find((issue) => issue.on.computer === 'pc').notes[0]).toMatchObject({ title: 'No answer over its cable, perhaps from Zero M3' });
+    });
+
     test('the pooling drawing is worked out on the server: cables, routers, every warning with its cause, and where memory runs', () => {
         const yes = (ms) => ({ ok: true, ms, why: null });
         const no = (why) => ({ ok: false, ms: null, why });
@@ -7368,7 +7405,7 @@ describe('Linked devices', () => {
         expect(apart.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
         // A cable with nobody at the other end and no computer with two cables to blame: check the cable.
         const lone = poolScene({ ...view, computers: view.computers.map((one) => ({ ...one, problems: [] })), checks: { at: new Date(), pairs: [] } });
-        expect(lone.issues.find((issue) => issue.on.computer === 'i9').notes).toEqual([{ level: 'warning', title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: [expect.stringMatching(/^Check that the cable is plugged in at both ends/)] }]);
+        expect(lone.issues.find((issue) => issue.on.computer === 'i9').notes).toEqual([{ level: 'warning', title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: [expect.stringMatching(/^Unplug the cable at both ends and plug it back in/), 'Check that the computer at the other end is on, with Mollama open.'] }]);
         // Before any check, nothing is said about cables, and no memory is drawn.
         const unchecked = poolScene({ ...view, checks: null });
         expect(unchecked.cables).toEqual([]);
