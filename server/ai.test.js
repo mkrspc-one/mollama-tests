@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7167,6 +7167,80 @@ describe('Linked devices', () => {
         expect(connectionProblems(undefined, 'darwin')).toEqual([]);
     });
 
+    test('a computer with two bare cables is told that only one works at a time, and how to give one its own addresses', () => {
+        const mac = { adapters: [
+            { name: 'Wi-Fi', kind: 'wifi', link: true, addresses: ['10.0.0.66'], internet: true },
+            { name: 'Thunderbolt Bridge', kind: 'thunderbolt', link: true, addresses: ['169.254.10.2'], internet: false },
+            { name: 'USB 10/100/1000 LAN', kind: 'ethernet', link: true, addresses: ['169.254.30.2'], internet: false },
+            { name: 'Thunderbolt 1 (en1)', kind: 'thunderbolt', link: true, addresses: [], internet: false }
+        ] };
+        const [found] = connectionProblems(mac, 'darwin').filter((one) => one.kind === 'twocables');
+        expect(found).toMatchObject({ level: 'problem', adapter: 'Thunderbolt Bridge' });
+        expect(found.message).toMatch(/Thunderbolt Bridge and USB 10\/100\/1000 LAN/);
+        expect(found.message).toMatch(/Configure IPv4 to Manually, IP address 10\.254\.1\.1/);
+        expect(found.message).toMatch(/other end of that cable, the same with 10\.254\.1\.2/);
+        expect(connectionProblems({ adapters: mac.adapters.slice(0, 2) }, 'darwin').some((one) => one.kind === 'twocables')).toBe(false);
+        expect(connectionProblems({ adapters: [...mac.adapters.slice(0, 2), { name: 'Ethernet', kind: 'ethernet', link: true, addresses: ['169.254.5.5'] }] }, 'win32')[0].message).toMatch(/Settings, Network & internet, Ethernet, Thunderbolt Bridge/);
+        // Addresses given by hand in 10.254 are a cable of their own: each one its own network, drawn as a cable.
+        expect([privateKind('10.254.1.2'), privateKind('10.0.0.5'), privateKind('169.254.1.1')]).toEqual(['cable', 'home', 'cable']);
+        const at = (id, address) => ({ id, name: id, online: true, publicAddress: '203.0.113.9', hardware: { gpuMemoryMb: 0, memoryMb: 8192, network: { addresses: [{ address, prefix: 24, interface: 'Thunderbolt Bridge', wired: true, category: 'public' }] } } });
+        const { groups } = poolGroups([at('i9', '10.254.1.2'), at('m3', '10.254.1.1')]);
+        expect(groups).toEqual([expect.objectContaining({ network: '10.254.1.0/24', via: 'cable' })]);
+    });
+
+    test('the pooling drawing is worked out on the server: cables, routers, every warning with its cause, and where memory runs', () => {
+        const yes = (ms) => ({ ok: true, ms, why: null });
+        const no = (why) => ({ ok: false, ms: null, why });
+        const computer = (id, extra = {}) => ({ id, name: id, online: true, role: 'off', known: true, lending: false, reachable: null, problems: [], cables: [], homes: [], reason: null, publicNetworks: [], ...extra });
+        const twoCables = { kind: 'twocables', level: 'problem', adapter: 'Thunderbolt Bridge', message: 'Two bare cables.' };
+        const view = {
+            main: 'pc',
+            computers: [
+                computer('pc', { role: 'main', cables: ['ethernet'], homes: [{ id: 'h1', wired: false, public: true, name: 'A9000_NETGEAR' }] }),
+                computer('m3', { role: 'lend', lending: true, reachable: true, cables: ['thunderbolt', 'ethernet'], problems: [twoCables], homes: [{ id: 'h1', wired: false, public: false }] }),
+                computer('i9', { cables: ['thunderbolt'], homes: [{ id: 'h1', wired: false, public: false }] }),
+                computer('zero', { online: false, reason: 'offline', message: 'Not connected right now.' })
+            ],
+            networks: [{ network: '169.254.0.0/16', via: 'cable', computers: [{ id: 'pc' }, { id: 'm3' }, { id: 'i9' }] }],
+            checks: { at: new Date(), pairs: [
+                { a: 'm3', b: 'pc', via: 'cable', verdict: 'works', from: null, there: yes(3.6), back: yes(3.9) },
+                { a: 'i9', b: 'm3', via: 'wifi', verdict: 'oneway', from: 'm3', there: no('Nothing answered.'), back: yes(2) }
+            ] }
+        };
+        const scene = poolScene(view);
+        // The one cable the checks found, with network plugs since only one end has Thunderbolt.
+        expect(scene.cables).toEqual([{ a: 'm3', b: 'pc', plug: 'ethernet' }]);
+        // One router for the home network, every online computer on it, the Public one marked as not usable.
+        expect(scene.homes).toEqual([{ id: 'home:h1', members: [{ id: 'pc', way: 'wifi', open: false }, { id: 'm3', way: 'wifi', open: true }, { id: 'i9', way: 'wifi', open: true }] }]);
+        const on = (where) => scene.issues.find((issue) => JSON.stringify(issue.on) === JSON.stringify(where));
+        // The Public Wi-Fi: a warning on its own line, with the steps to make it Private for that network.
+        expect(on({ line: ['home:h1', 'pc'] })).toMatchObject({ fix: { kind: 'private', name: 'pc', networks: ['A9000_NETGEAR'] } });
+        // The computer with two cables says so; the one whose cable it drops is told why, not to check its cable.
+        expect(on({ computer: 'm3' }).texts).toEqual(['Two bare cables.']);
+        expect(on({ computer: 'i9' }).texts).toEqual([expect.stringMatching(/because m3 has two bare cables/)]);
+        // Offline is said under the name, never as a warning.
+        expect(on({ computer: 'zero' })).toBeUndefined();
+        // Memory runs from the secondary computer over the cable the primary reached it by.
+        expect(scene.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
+
+        // A secondary computer the primary cannot reach: a warning on it, and no memory drawn running.
+        const unreached = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, reachable: false, detail: 'The gate did not answer.' } : one)) });
+        expect(unreached.flows).toEqual([]);
+        expect(unreached.issues.find((issue) => issue.on.computer === 'm3').texts).toContain('The gate did not answer.');
+        // A cable with nobody at the other end and no computer with two cables to blame: check the cable.
+        const lone = poolScene({ ...view, computers: view.computers.map((one) => ({ ...one, problems: [] })), checks: { at: new Date(), pairs: [] } });
+        expect(lone.issues.find((issue) => issue.on.computer === 'i9').texts).toEqual([expect.stringMatching(/^None of your computers answered over its cable\. Check that the cable is plugged in/)]);
+        // Before any check, nothing is said about cables, and no memory is drawn.
+        const unchecked = poolScene({ ...view, checks: null });
+        expect(unchecked.cables).toEqual([]);
+        expect(unchecked.flows).toEqual([]);
+        expect(unchecked.issues.some((issue) => issue.texts.some((text) => /answered over its cable/.test(text)))).toBe(false);
+        // Over a shared home network, when there is no cable between them.
+        const wifiOnly = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'pc' ? { ...one, homes: [{ id: 'h1', wired: true, public: false }] } : one)), networks: [], checks: { at: new Date(), pairs: [{ a: 'm3', b: 'pc', via: 'wifi', verdict: 'works', from: null, there: yes(5), back: yes(5) }] } });
+        expect(wifiOnly.flows).toEqual([{ from: 'm3', to: 'pc', home: 'home:h1' }]);
+        expect(poolScene({ computers: [], networks: [], checks: null, main: null })).toEqual({ cables: [], homes: [], issues: [], flows: [] });
+    });
+
     test('the checks between computers come back as one entry per pair and way, judged by what a pool needs', () => {
         const known = new Set(['i9', 'm3', 'pc']);
         const at = new Date();
@@ -7722,6 +7796,8 @@ describe('Linked devices', () => {
         macApp.ws.send(JSON.stringify({ type: 'network', data: home('10.9.8.20', { category: 'public' }) }));
         const apart = await groupNow(false);
         expect(apart.computers.find((one) => one.id === mac.id)).toMatchObject({ reason: 'public', publicNetworks: ['A9000_NETGEAR'] });
+        // Its Public Wi-Fi is still drawn, by a code that never holds its address, with the name the steps to make it Private need.
+        expect(apart.computers.find((one) => one.id === mac.id).homes).toEqual([{ id: expect.stringMatching(/^[0-9a-f]{12}$/), wired: false, public: true, name: 'A9000_NETGEAR' }]);
         // A model that fits only pooled still says so, with the pool off and why.
         const off = (await client.get(`/api/v1/devices/${pc.id}/catalogue?size=48`)).data.models.filter((model) => model.pool);
         expect(off.length).toBeGreaterThan(0);
@@ -7996,12 +8072,13 @@ describe('Linked devices', () => {
         };
         const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         try {
+            // Once on connecting and once more when its details are in, so a page that read it at once reads its network too.
             await fakeApp(id, key);
-            for (let attempt = 0; attempt < 50 && sent.length < 1; attempt++) await pause(10);
-            expect(sent).toEqual([true]);
+            for (let attempt = 0; attempt < 100 && sent.length < 2; attempt++) await pause(10);
+            expect(sent).toEqual([true, true]);
             await fakeApp(id, key);
             await pause(150);
-            expect(sent).toEqual([true]);
+            expect(sent).toEqual([true, true]);
         } finally {
             service.sendToUser = real;
         }
