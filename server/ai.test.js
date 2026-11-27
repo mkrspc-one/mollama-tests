@@ -24,10 +24,10 @@ import {
     fitModel, fitPool, freeHardware, poolShareMb, splitBySpeed, poolSplit, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, PYTHON_HOOK, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
+    poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -7143,6 +7143,53 @@ describe('Linked devices', () => {
         expect(chain).toHaveLength(1);
         expect(chain[0].computers.map((one) => [one.id, one.addresses])).toEqual([['i9', ['169.254.10.1']], ['m3', ['169.254.10.2', '169.254.20.2']], ['pc', ['169.254.20.1']]]);
         expect(chain[0].combined).toEqual({ gpuMemoryMb: 3 * 8192, memoryMb: 3 * 32768 });
+    });
+
+    test('what is wrong with a computer\'s connections is named, with the fix, from what its desktop app read', () => {
+        const mac = { adapters: [
+            { name: 'Wi-Fi', kind: 'wifi', link: true, addresses: ['10.0.0.66'], internet: false },
+            { name: 'Thunderbolt Bridge', kind: 'thunderbolt', link: true, addresses: [], internet: false },
+            { name: 'USB 10/100/1000 LAN', kind: 'ethernet', link: true, addresses: ['169.254.20.2'], internet: true },
+            { name: 'Ethernet Adapter (en4)', kind: 'ethernet', link: false, addresses: [], internet: false }
+        ] };
+        const found = connectionProblems(mac, 'darwin');
+        expect(found.map((one) => [one.kind, one.adapter])).toEqual([['noaddress', 'Thunderbolt Bridge'], ['route', 'USB 10/100/1000 LAN']]);
+        expect(found[0].message).toMatch(/Configure IPv4 to Using DHCP/);
+        expect(found[1].message).toMatch(/Set Service Order, and drag Wi-Fi to the top/);
+        // A port with no signal is only a note; a Mac's spare adapter entries say nothing.
+        const pc = { adapters: [
+            { name: 'Ethernet', kind: 'ethernet', link: false, addresses: [], internet: false },
+            { name: 'A9000_NETGEAR', kind: 'wifi', link: true, addresses: ['10.0.0.135'], internet: true, category: 'public' }
+        ] };
+        expect(connectionProblems(pc, 'win32')).toEqual([expect.objectContaining({ kind: 'nosignal', level: 'note', adapter: 'Ethernet' })]);
+        // A desktop app before 1.0.23 reads no adapters, so nothing is said.
+        expect(connectionProblems({ addresses: [] }, 'win32')).toEqual([]);
+        expect(connectionProblems(undefined, 'darwin')).toEqual([]);
+    });
+
+    test('the checks between computers come back as one line per pair and way, both directions', () => {
+        const names = new Map([['i9', 'zero i9'], ['m3', 'Zero M3'], ['pc', 'zero-pc']]);
+        const at = new Date();
+        const summary = linkSummary({ at, results: [
+            // The Mac in the middle has an address on each cable; only the one on the cable to the other Mac answers it.
+            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.20.2', ok: false, why: 'silent' },
+            { from: 'i9', to: 'm3', via: 'cable', address: '169.254.10.2', ok: true, ms: 0.6 },
+            { from: 'm3', to: 'i9', via: 'cable', address: '169.254.10.1', ok: true, ms: 0.7 },
+            { from: 'm3', to: 'pc', via: 'cable', address: '169.254.30.1', ok: true, ms: 0.9 },
+            { from: 'pc', to: 'm3', via: 'cable', address: '169.254.30.2', ok: false, why: 'silent' },
+            { from: 'i9', to: 'm3', via: 'wifi', address: '10.0.0.66', ok: null, why: 'update' },
+            { from: 'm3', to: 'i9', via: 'wifi', address: '10.0.0.231', ok: null, why: 'update' }
+        ] }, names);
+        expect(summary.at).toBe(at);
+        expect(summary.pairs.map((pair) => [pair.aName, pair.bName, pair.via, pair.there.ok, pair.back?.ok])).toEqual([
+            ['zero i9', 'Zero M3', 'cable', true, true],
+            ['Zero M3', 'zero-pc', 'cable', true, false],
+            ['zero i9', 'Zero M3', 'wifi', null, null]
+        ]);
+        expect(summary.pairs[0].there.ms).toBe(0.6);
+        expect(summary.pairs[1].back.why).toMatch(/firewall/);
+        expect(summary.pairs[2].there.why).toMatch(/^Update the Mollama desktop app/);
+        expect(linkSummary(null, names)).toBeNull();
     });
 
     test('lessons are read from lines of JSON or from plain text, and what is wrong with them is said plainly', () => {
