@@ -14,7 +14,7 @@ import { Server } from '../../server/server.js';
 import { Rental } from '../../server/models/ai.model.js';
 import { setHyperstackFetch, setRunpodFetch, machinePrefix } from '../../server/middleware/ai.middleware.js';
 import { balanceOf, addCredit, charge, settle } from '../../server/controllers/billing.controller.js';
-import { rentalsOn, rentalsSafeHere, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
+import { rentalsOn, rentalsSafeHere, cardKey, rentalPrice, rentalSpent, watchRentals, sweepRentals, compareRentals } from '../../server/controllers/ai.controller.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
@@ -8706,6 +8706,12 @@ describe('Linked devices', () => {
             // RunPod has no L40 free, so Hyperstack's is offered at Hyperstack's price.
             expect(price['l40-48x1']).toBe(L40_PRICE);
             expect(JSON.stringify(listed)).not.toMatch(/runpod|hyperstack|NVIDIA|n3-/i);
+            // Admins and owners see who supplies each card, to check the list.
+            await testStartup.loginAsUser('admin');
+            const forAdmin = (await client.get('/api/v1/rentals/cards')).data;
+            expect(forAdmin.cards.find((card) => card.flavor === 'l40s-48x1').source).toMatch(/^RunPod: NVIDIA L40S/);
+            expect(forAdmin.cards.find((card) => card.flavor === 'l40-48x1').source).toMatch(/^Hyperstack: n3-L40x1/);
+            await testStartup.loginAsUser('user');
 
             const started = await client.post('/api/v1/rentals', { flavor: 'l40s-48x1', price: rentalPrice(86) }, any);
             expect(started.status).toBe(201);
@@ -8741,6 +8747,19 @@ describe('Linked devices', () => {
             expect(rental.price).toBe(L40_PRICE);
             expect(hs.machines.size).toBe(1);
         }));
+
+        test('one name per kind of card across providers, without mixing up similar cards', () => {
+            const key = (gpu, gb, count = 1) => cardKey({ gpu, memoryMb: gb * 1024 * count, count });
+            expect(key('RTX-A6000-ada', 48)).toBe('rtx6000ada-48x1');
+            expect(key('RTX 6000 Ada', 48)).toBe('rtx6000ada-48x1');
+            expect(key('RTX-A6000', 48)).toBe('rtxa6000-48x1');
+            expect(key('RTX A6000', 48)).toBe('rtxa6000-48x1');
+            expect(key('A100-80G-PCIe', 80)).toBe(key('A100 SXM', 80));
+            expect(key('L40S', 48)).not.toBe(key('L40', 48));
+            expect(key('L4', 24)).toBe('l4-24x1');
+            expect(key('RTX A4000', 16)).toBe('rtxa4000-16x1');
+            expect(key('A100-80G-SXM4', 80, 8)).toBe('a100-80x8');
+        });
 
         test('the sweep deletes a RunPod machine that no rental of RunPod\'s knows', () => withRunpod(async () => {
             rp.pods.set('stray', { id: 'stray', name: `${machinePrefix()}${new mongoose.Types.ObjectId()}`, status: 'RUNNING' });
