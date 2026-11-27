@@ -7175,10 +7175,11 @@ describe('Linked devices', () => {
             { name: 'Thunderbolt 1 (en1)', kind: 'thunderbolt', link: true, addresses: [], internet: false }
         ] };
         const [found] = connectionProblems(mac, 'darwin').filter((one) => one.kind === 'twocables');
-        expect(found).toMatchObject({ level: 'problem', adapter: 'Thunderbolt Bridge' });
+        expect(found).toMatchObject({ level: 'problem', adapter: 'Thunderbolt Bridge', title: 'Two cables on one computer', text: 'Thunderbolt Bridge and USB 10/100/1000 LAN take their addresses from the same range, so only one of them works at a time.' });
+        expect(found.steps).toHaveLength(3);
         expect(found.message).toMatch(/Thunderbolt Bridge and USB 10\/100\/1000 LAN/);
         expect(found.message).toMatch(/Configure IPv4 to Manually, IP address 10\.254\.1\.1/);
-        expect(found.message).toMatch(/other end of that cable, the same with 10\.254\.1\.2/);
+        expect(found.message).toMatch(/other end of that cable, do the same with 10\.254\.1\.2/);
         expect(connectionProblems({ adapters: mac.adapters.slice(0, 2) }, 'darwin').some((one) => one.kind === 'twocables')).toBe(false);
         expect(connectionProblems({ adapters: [...mac.adapters.slice(0, 2), { name: 'Ethernet', kind: 'ethernet', link: true, addresses: ['169.254.5.5'] }] }, 'win32')[0].message).toMatch(/Settings, Network & internet, Ethernet, Thunderbolt Bridge/);
         // Addresses given by hand in 10.254 are a cable of their own: each one its own network, drawn as a cable.
@@ -7192,7 +7193,7 @@ describe('Linked devices', () => {
         const yes = (ms) => ({ ok: true, ms, why: null });
         const no = (why) => ({ ok: false, ms: null, why });
         const computer = (id, extra = {}) => ({ id, name: id, online: true, role: 'off', known: true, lending: false, reachable: null, problems: [], cables: [], homes: [], reason: null, publicNetworks: [], ...extra });
-        const twoCables = { kind: 'twocables', level: 'problem', adapter: 'Thunderbolt Bridge', message: 'Two bare cables.' };
+        const twoCables = { kind: 'twocables', level: 'problem', adapter: 'Thunderbolt Bridge', title: 'Two cables on one computer', text: 'Only one of them works at a time.', steps: ['Give one its own addresses.'], message: 'Only one of them works at a time. Give one its own addresses.' };
         const view = {
             main: 'pc',
             computers: [
@@ -7208,16 +7209,17 @@ describe('Linked devices', () => {
             ] }
         };
         const scene = poolScene(view);
-        // The one cable the checks found, with network plugs since only one end has Thunderbolt.
-        expect(scene.cables).toEqual([{ a: 'm3', b: 'pc', plug: 'ethernet' }]);
-        // One router for the home network, every online computer on it, the Public one marked as not usable.
-        expect(scene.homes).toEqual([{ id: 'home:h1', members: [{ id: 'pc', way: 'wifi', open: false }, { id: 'm3', way: 'wifi', open: true }, { id: 'i9', way: 'wifi', open: true }] }]);
+        // The one cable the checks found, working (success), with network plugs since only one end has Thunderbolt.
+        expect(scene.cables).toEqual([{ a: 'm3', b: 'pc', state: 'works', plug: 'ethernet' }]);
+        // One router for the home network and every online computer on it: the Public line cannot be used (error), the two
+        // that answered each other over it work (success).
+        expect(scene.homes).toEqual([{ id: 'home:h1', members: [{ id: 'pc', way: 'wifi', open: false, state: 'error' }, { id: 'm3', way: 'wifi', open: true, state: 'works' }, { id: 'i9', way: 'wifi', open: true, state: 'works' }] }]);
         const on = (where) => scene.issues.find((issue) => JSON.stringify(issue.on) === JSON.stringify(where));
-        // The Public Wi-Fi: a warning on its own line, with the steps to make it Private for that network.
-        expect(on({ line: ['home:h1', 'pc'] })).toMatchObject({ fix: { kind: 'private', name: 'pc', networks: ['A9000_NETGEAR'] } });
-        // The computer with two cables says so; the one whose cable it drops is told why, not to check its cable.
-        expect(on({ computer: 'm3' }).texts).toEqual(['Two bare cables.']);
-        expect(on({ computer: 'i9' }).texts).toEqual([expect.stringMatching(/because m3 has two bare cables/)]);
+        // The Public Wi-Fi: an error on its own line, a short title and one sentence, and the steps to make it Private.
+        expect(on({ line: ['home:h1', 'pc'] })).toMatchObject({ level: 'error', notes: [{ level: 'error', title: 'Public Wi-Fi', text: 'Windows treats this Wi-Fi as public on pc, so Mollama does not pool over it.' }], fix: { kind: 'private', name: 'pc', networks: ['A9000_NETGEAR'] } });
+        // The computer with two cables says so, with its steps; the one whose cable it drops is told why, not to check its cable.
+        expect(on({ computer: 'm3' })).toMatchObject({ level: 'warning', notes: [{ title: 'Two cables on one computer', text: 'Only one of them works at a time.', steps: ['Give one its own addresses.'] }] });
+        expect(on({ computer: 'i9' }).notes).toEqual([expect.objectContaining({ title: 'No answer over its cable', text: expect.stringMatching(/^m3 has two bare cables and uses only one of them/) })]);
         // Offline is said under the name, never as a warning.
         expect(on({ computer: 'zero' })).toBeUndefined();
         // Memory runs from the secondary computer over the cable the primary reached it by.
@@ -7226,15 +7228,25 @@ describe('Linked devices', () => {
         // A secondary computer the primary cannot reach: a warning on it, and no memory drawn running.
         const unreached = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'm3' ? { ...one, reachable: false, detail: 'The gate did not answer.' } : one)) });
         expect(unreached.flows).toEqual([]);
-        expect(unreached.issues.find((issue) => issue.on.computer === 'm3').texts).toContain('The gate did not answer.');
+        expect(unreached.issues.find((issue) => issue.on.computer === 'm3')).toMatchObject({ level: 'error', notes: expect.arrayContaining([expect.objectContaining({ title: 'Primary cannot reach it', text: 'The gate did not answer.' })]) });
+        // A secondary computer joined to the primary only through another computer: said plainly, never a firewall guess.
+        const apart = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'i9' ? { ...one, role: 'lend', lending: true, reachable: false, detail: 'Nothing answered. A firewall on it is probably blocking Mollama.' } : { ...one, problems: [] })), checks: { at: new Date(), pairs: [
+            { a: 'm3', b: 'pc', via: 'cable', verdict: 'works', from: null, there: yes(3.6), back: yes(3.9) },
+            { a: 'i9', b: 'm3', via: 'cable', verdict: 'works', from: null, there: yes(0.7), back: yes(0.8) }
+        ] } });
+        const alone = apart.issues.find((issue) => issue.on.computer === 'i9');
+        expect(alone).toMatchObject({ level: 'error', notes: [{ title: 'No connection of its own', text: 'i9 reaches pc only through m3, and a secondary computer needs its own connection to the primary one.' }] });
+        expect(alone.notes[0].steps[0]).toMatch(/^Join i9 and pc with a cable/);
+        expect(JSON.stringify(apart.issues)).not.toMatch(/firewall/i);
+        expect(apart.flows).toEqual([{ from: 'm3', to: 'pc', cable: ['m3', 'pc'] }]);
         // A cable with nobody at the other end and no computer with two cables to blame: check the cable.
         const lone = poolScene({ ...view, computers: view.computers.map((one) => ({ ...one, problems: [] })), checks: { at: new Date(), pairs: [] } });
-        expect(lone.issues.find((issue) => issue.on.computer === 'i9').texts).toEqual([expect.stringMatching(/^None of your computers answered over its cable\. Check that the cable is plugged in/)]);
+        expect(lone.issues.find((issue) => issue.on.computer === 'i9').notes).toEqual([{ level: 'warning', title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: [expect.stringMatching(/^Check that the cable is plugged in at both ends/), 'Then press Check again.'] }]);
         // Before any check, nothing is said about cables, and no memory is drawn.
         const unchecked = poolScene({ ...view, checks: null });
         expect(unchecked.cables).toEqual([]);
         expect(unchecked.flows).toEqual([]);
-        expect(unchecked.issues.some((issue) => issue.texts.some((text) => /answered over its cable/.test(text)))).toBe(false);
+        expect(unchecked.issues.some((issue) => issue.notes.some((note) => /answered over its cable/.test(note.text)))).toBe(false);
         // Over a shared home network, when there is no cable between them.
         const wifiOnly = poolScene({ ...view, computers: view.computers.map((one) => (one.id === 'pc' ? { ...one, homes: [{ id: 'h1', wired: true, public: false }] } : one)), networks: [], checks: { at: new Date(), pairs: [{ a: 'm3', b: 'pc', via: 'wifi', verdict: 'works', from: null, there: yes(5), back: yes(5) }] } });
         expect(wifiOnly.flows).toEqual([{ from: 'm3', to: 'pc', home: 'home:h1' }]);
