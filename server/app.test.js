@@ -1664,4 +1664,46 @@ describe('App Controller and Routes - Comprehensive Tests', () => {
             expect((await client.get('/api/v1/notifications')).status).toBe(401);
         });
     });
+
+    describe('Saved warnings and errors', () => {
+        const findSoon = async (query) => {
+            const { default: Log } = await import('../../server/models/log.model.js');
+            for (let tries = 0; tries < 40; tries++) {
+                const record = await Log.findOne(query).lean();
+                if (record && (query.method === undefined || record.notes?.length)) return record;
+                await new Promise((done) => setTimeout(done, 250));
+            }
+            return null;
+        };
+
+        test('a warning in a request is kept on the record of that request', async () => {
+            const url = `/api/v1/no-such-place-${Date.now()}`;
+            expect((await client.get(url)).status).toBe(404);
+            const record = await findSoon({ url, method: 'GET' });
+            expect(record.notes.some((note) => note.level === 'warn' && /not found|Invalid route/i.test(note.message) && !note.message.includes('\u001b'))).toBe(true);
+        });
+
+        test('a warning outside any request is a record of its own, and an info line only when kept', async () => {
+            const { default: logger } = await import('../../server/utils/app.logger.js');
+            const word = `outside${Date.now()}`;
+            logger.warn(`A test warning ${word}`, { word });
+            logger.info(`A test line ${word} kept`, { keep: true });
+            logger.info(`A test line ${word} not kept`);
+            const warning = await findSoon({ message: new RegExp(`warning ${word}`) });
+            expect(warning).toMatchObject({ level: 'warn' });
+            expect(warning.method).toBeUndefined();
+            expect(warning.meta.detail).toContain(word);
+            expect(await findSoon({ message: new RegExp(`${word} kept`) })).toMatchObject({ level: 'info' });
+            const { default: Log } = await import('../../server/models/log.model.js');
+            expect(await Log.findOne({ message: new RegExp(`${word} not kept`) })).toBeNull();
+        });
+
+        test('a large response keeps as much of its start as fits', async () => {
+            const { truncateObject } = await import('../../server/utils/sanitize.js');
+            const kept = truncateObject({ rows: Array.from({ length: 2000 }, (_, at) => ({ at, name: `row "${at}"` })) }, 16384);
+            expect(kept._truncated).toBe(true);
+            expect(JSON.stringify(kept).length).toBeLessThanOrEqual(16384);
+            expect(kept.summary.length).toBeGreaterThan(10000);
+        });
+    });
 });

@@ -27,7 +27,7 @@ import {
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -50,6 +50,9 @@ afterAll(async () => {
     resetOllamaClientFactory();
     await testStartup.cleanup();
 }, 30000);
+
+// What was sent to a model that calls functions itself, less the request added after a skill page (guideReminder).
+const unreminded = (text) => String(text).replace(/\n\n\[The instructions above are for you to work by\.[^]*$/, '');
 
 describe('Model rights', () => {
     test('MANAGE_MODELS and USE_MODELS exist', () => {
@@ -2810,7 +2813,7 @@ describe('Chat endpoints', () => {
             state.toolPlan = [[['open_component_page', { component: 'Badge' }], ['Calculator', { expression: '2 + 2' }], ['fly_to_the_moon', { speed: 'fast' }]]];
             state.chatReply = 'Done.';
             const { events: list } = await send(chat.id, { content: 'try these' });
-            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool').map((message) => ({ ...message, content: unreminded(message.content) }));
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
             expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, compress_context, list_my_files, read_my_file, save_to_files, date_time, calculator, read_web_page\.$/);
@@ -4680,7 +4683,8 @@ describe('Chat endpoints', () => {
             // A model is told the function is for reading: some took a page for the drawing itself and said they could not draw.
             expect(opener.function.description).toMatch(/only returns the page and draws nothing: a component is drawn by writing its tags in your reply, inside a ```component fence\.$/);
             // The two it asked for come back together, and only those two.
-            expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: `${page('Flow')}\n\n${page('Badge')}` });
+            expect(state.chatCalls[1].messages.at(-1).role).toBe('tool');
+            expect(unreminded(state.chatCalls[1].messages.at(-1).content)).toBe(`${page('Flow')}\n\n${page('Badge')}`);
             expect(pageText(state.chatCalls[1])).toEqual(['Badge', 'Flow']);
             expect(list.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Component', input: 'Flow, Badge' });
 
@@ -4951,7 +4955,7 @@ describe('Chat endpoints', () => {
             const opened = state.chatCalls[1].messages.at(-1);
             expect(opened.role).toBe('tool');
             expect(opened.content.startsWith(copy.text)).toBe(true);
-            expect(opened.content.slice(copy.text.length)).toMatch(/^\n\nGOES WITH\n(On in this chat, open with open_skill when the request needs it: .+\.\n)?In the library, not on: .+\. When one would help, tell the user its name; they turn it on under Skills\.$/);
+            expect(unreminded(opened.content).slice(copy.text.length)).toMatch(/^\n\nGOES WITH\n(On in this chat, open with open_skill when the request needs it: .+\.\n)?In the library, not on: .+\. When one would help, tell the user its name; they turn it on under Skills\.$/);
             expect(list.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Skill', input: 'Copywriting' });
             expect(list.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Skill', input: 'Copywriting', failed: null }]);
             expect(list.at(-1).reply.content).toBe('Here is the headline.');
@@ -6131,6 +6135,24 @@ describe('Chat endpoints', () => {
                 } finally {
                     setPermissionWait(null);
                 }
+            });
+
+            test('a model that calls functions itself is given the request again after a skill page, in what is sent only', () => {
+                const page = { role: 'tool', tool_name: 'open_skill', content: 'SKILL: Anatomy\n\n# Anatomy' };
+                pagesGiven.add(page);
+                const messages = [{ role: 'user', content: 'Draw an e-bike.' }, { role: 'assistant', content: '', tool_calls: [{ function: { name: 'open_skill' } }] }, page];
+                const sent = guideReminder(messages, 'Draw an e-bike.');
+                expect(sent.at(-1).content).toMatch(/^SKILL: Anatomy\n\n# Anatomy\n\n\[The instructions above are for you to work by\.[^]*Draw an e-bike\.\n\nDo the next step of it now/);
+                expect(page.content).toBe('SKILL: Anatomy\n\n# Anatomy');
+                expect(sent.slice(0, -1)).toEqual(messages.slice(0, -1));
+                const two = [...messages, { role: 'tool', tool_name: 'calculator', content: '4' }];
+                expect(guideReminder(two, 'Draw an e-bike.').at(-1).content).toMatch(/^4\n\n\[The instructions above/);
+                const plain = [messages[0], messages[1], { role: 'tool', tool_name: 'calculator', content: '4' }];
+                expect(guideReminder(plain, 'Draw an e-bike.')).toBe(plain);
+                expect(guideReminder([...messages, { role: 'assistant', content: 'Done.' }], 'Draw an e-bike.').at(-1).content).toBe('Done.');
+                // A call that failed is an error, not a page: nothing is added after it.
+                const failed = [messages[0], messages[1], { role: 'tool', tool_name: 'open_skill', content: 'There is no skill by that name in this chat.' }];
+                expect(guideReminder(failed, 'Draw an e-bike.')).toBe(failed);
             });
 
             test('a model whose template has no place for functions is told of them in words, calls them in words and is given back what they returned', async () => {
