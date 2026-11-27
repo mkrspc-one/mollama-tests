@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -1636,10 +1636,13 @@ describe('Model endpoints', () => {
             expect(mine.data.permissions.manage).toBe(true);
             expect(mine.data.models.find((model) => model.tag === 'qwen2.5-coder:7b').installed).toBe(true);
             expect(mine.data.models.find((model) => model.tag === 'llama3.2:3b').installed).toBe(false);
+            // A computer's list holds only what can be downloaded onto it: models that run only online are left out.
+            expect(mine.data.models.some((model) => model.cloudOnly)).toBe(false);
+            expect((await get(`/devices/${device.id}/catalogue?q=kimi`)).data.models).toEqual([]);
 
             signOut();
             const visitor = await get('/catalogue?memoryMb=32768&gpuMemoryMb=8192');
-            const verdicts = (data) => data.models.map((model) => [model.tag, model.fit.verdict]).sort();
+            const verdicts = (data) => data.models.filter((model) => !model.cloudOnly).map((model) => [model.tag, model.fit.verdict]).sort();
             expect(verdicts(mine.data)).toEqual(verdicts(visitor.data));
 
             // The list for a computer is only the list: the recommended models are asked for on their own, and no
@@ -1763,6 +1766,98 @@ describe('Model endpoints', () => {
             expect(response.data).toMatchObject({ code: 'DISK_FULL', neededMb: 43000, freeMb: 1500 });
             expect(response.data.message).toMatch(/42 GB|43 GB/);
             expect(await Download.countDocuments({})).toBe(0);
+        });
+
+        test('counts downloads still to come on the same computer before taking another', async () => {
+            downloads.setDiskProbe(async () => ({ diskFreeMb: 30000, diskTotalMb: 100000 }));
+            await testStartup.loginAsUser('admin');
+            // A paused download of 19 GB, a quarter done, still needs about 14 GB of the 30 GB free.
+            await Download.create({ model: 'qwen3:30b', device: null, status: 'paused', requestedBy: testStartup.admin.id, totalBytes: 19000 * 1024 * 1024, completedBytes: 4750 * 1024 * 1024 });
+            const tooMuch = await post('/models/pull', { name: 'qwen2.5-coder:32b' });
+            expect(tooMuch.status).toBe(422);
+            expect(tooMuch.data).toMatchObject({ code: 'DISK_FULL', neededMb: 20000, freeMb: 30000 - 14250 });
+            const fits = await post('/models/pull', { name: 'phi4:14b' });
+            expect(fits.status).toBe(202);
+            await downloads.stop(fits.data.download.id, 'cancel');
+        });
+
+        test('finds GGUF models on Hugging Face, lists their downloads one per size, and checks one against the disk', async () => {
+            const asked = [];
+            const repo = 'someone/Tiny-Chat-8B-GGUF';
+            const file = (rfilename, mb) => ({ rfilename, size: mb * 1024 * 1024 });
+            setTrainFetch(async (address) => {
+                asked.push(address);
+                const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+                if (address.includes('/api/models?search=')) return json([{ id: repo, downloads: 900, likes: 12, lastModified: '2026-11-01T00:00:00Z' }, { id: 'someone/Locked-GGUF', gated: 'manual' }]);
+                if (address.includes(`/api/models/${repo}?blobs=true`)) {
+                    return json({ id: repo, gguf: { total: 8030000000 }, cardData: { license: 'apache-2.0' }, siblings: [
+                        file('Tiny-Chat-8B-Q8_0.gguf', 8100), file('Tiny-Chat-8B-Q4_K_M.gguf', 4700), file('README.md', 0),
+                        file('big/Tiny-Chat-8B-F16-00001-of-00002.gguf', 9000), file('mmproj-Tiny-Chat-F16.gguf', 600)
+                    ] });
+                }
+                return json({ error: 'Repository not found' }, 404);
+            });
+            try {
+                await testStartup.loginAsUser('admin');
+                expect((await get('/huggingface?q=ti')).data.models).toEqual([]);
+                expect(asked).toEqual([]);
+                const found = (await get('/huggingface?q=tiny chat')).data.models;
+                expect(found).toEqual([{ repo, downloads: 900, likes: 12, updated: '2026-11-01T00:00:00Z', parameters: 8 }]);
+                expect(asked[0]).toBe('https://huggingface.co/api/models?search=tiny%20chat&filter=gguf&sort=downloads&direction=-1&limit=20');
+
+                const device = (await get('/devices')).data.devices[0];
+                const files = (await get(`/huggingface/files?repo=${repo}&device=${device.id}`)).data;
+                expect(files).toMatchObject({ repo, parameters: 8, licence: 'apache-2.0' });
+                expect(files.quants.map((one) => [one.quant, one.sizeMb, one.name])).toEqual([['Q4_K_M', 4700, `hf.co/${repo}:Q4_K_M`], ['Q8_0', 8100, `hf.co/${repo}:Q8_0`]]);
+                expect(files.quants[0].fit.verdict).toBeTruthy();
+                expect((await get('/huggingface/files?repo=someone/missing')).data.code).toBe('HUB_NOT_FOUND');
+
+                downloads.setDiskProbe(async () => ({ diskFreeMb: 6000, diskTotalMb: 100000 }));
+                const tooMuch = await post('/models/pull', { name: `hf.co/${repo}:Q8_0` });
+                expect(tooMuch.data).toMatchObject({ code: 'DISK_FULL', neededMb: 8100 });
+                const fits = await post('/models/pull', { name: `hf.co/${repo}:Q4_K_M` });
+                expect(fits.status).toBe(202);
+                await downloads.stop(fits.data.download.id, 'cancel');
+            } finally {
+                setTrainFetch();
+            }
+        });
+
+        test('a computer\'s list holds the library\'s models and Hugging Face\'s in one, each model once, with the same fit check', async () => {
+            const page = (models, next = null) => ({ ok: true, status: 200, headers: new Headers(next ? { link: `<${next}>; rel="next"` } : {}), json: async () => models });
+            const asked = [];
+            setTrainFetch(async (address) => {
+                asked.push(address);
+                if (address.includes('cursor=two')) return page([{ id: 'someone/Late-3B-GGUF', gguf: { total: 3.1e9 }, downloads: 3 }]);
+                return page([
+                    { id: 'someone/phi-4-GGUF', gguf: { total: 14.7e9 }, downloads: 50 },
+                    { id: 'other/Phi-4-GGUF', gguf: { total: 14.7e9 }, downloads: 40 },
+                    { id: 'someone/Tiny-Chat-8B-GGUF', gguf: { total: 8.03e9, context_length: 32768 }, downloads: 900, pipeline_tag: 'image-text-to-text' },
+                    { id: 'someone/Locked-GGUF', gated: 'manual', gguf: { total: 1e9 } },
+                    { id: 'someone/No-Facts-GGUF' }
+                ], 'https://huggingface.co/api/models?cursor=two');
+            });
+            try {
+                await testStartup.loginAsUser('admin');
+                const device = (await get('/devices')).data.devices[0];
+                const list = (await get(`/devices/${device.id}/catalogue?size=48&all=true`)).data;
+                // The library's phi4 gains the most downloaded copy from Hugging Face; the second copy is not shown again.
+                expect(list.models.find((model) => model.tag === 'phi4:14b')).toMatchObject({ hub: 'someone/phi-4-GGUF' });
+                expect(list.models.some((model) => /phi-4/i.test(model.tag))).toBe(false);
+                // A model only on Hugging Face is a card of its own, its size estimated from its parameters and fitted the same way.
+                expect(list.models.find((model) => model.tag === 'hf.co/someone/Tiny-Chat-8B-GGUF')).toMatchObject({ source: 'huggingface', hub: 'someone/Tiny-Chat-8B-GGUF', name: 'Tiny-Chat-8B', parameters: 8, sizeEstimated: true, capabilities: ['vision'], fit: { verdict: expect.any(String) } });
+                expect(list.models.find((model) => model.tag === 'hf.co/someone/Tiny-Chat-8B-GGUF').sizeMb).toBe(Math.round(8.03e9 * 0.6 / (1024 * 1024)));
+                expect(list.models.some((model) => /Locked|No-Facts/.test(model.tag))).toBe(false);
+                // The list stops at 200 and says whether there is more; the next page of Hugging Face is read only when needed.
+                expect(list).toMatchObject({ limit: 200, hubDown: false });
+                expect(list.models.some((model) => model.tag === 'hf.co/someone/Late-3B-GGUF')).toBe(true);
+                expect(asked[0]).toContain('filter=gguf');
+                const searched = (await get(`/devices/${device.id}/catalogue?q=tiny`)).data;
+                expect(asked.some((address) => address.includes('search=tiny'))).toBe(true);
+                expect(searched.models.some((model) => model.tag === 'hf.co/someone/Tiny-Chat-8B-GGUF')).toBe(true);
+            } finally {
+                setTrainFetch();
+            }
         });
 
         test('stops an unlisted model that turns out to be too large', async () => {
@@ -9338,6 +9433,30 @@ describe('Linked devices', () => {
             expect((await client.post(`/api/v1/rentals/${rental.id}/extend`, { hours: 1 }, any)).data.code).toBe('RENTAL_ENDING');
         });
 
+        test('models chosen when renting must fit its disk, and are queued onto it as soon as it links', async () => {
+            const tooMuch = await rent('admin', { flavor: 'n3-L40x1', models: ['llama3.3:70b', 'qwen2.5-coder:32b', 'gemma3:27b', 'qwen3:30b'] });
+            expect(tooMuch.data).toMatchObject({ code: 'MODELS_TOO_LARGE', totalMb: 99000, roomMb: Math.floor(100 * 1024 * 0.85) });
+            expect(hs.machines.size).toBe(0);
+
+            const chosen = ['phi4:14b', 'qwen2.5:14b'];
+            const { rental } = (await rent('admin', { flavor: 'n3-L40x1', models: chosen })).data;
+            expect(rental.models).toEqual(chosen);
+            expect(await Download.countDocuments({ device: rental.device })).toBe(0);
+            await linked(rental);
+            try {
+                await expect.poll(async () => (await Download.find({ device: rental.device })).map((job) => job.model).sort(), { timeout: 5000 }).toEqual([...chosen].sort());
+                // Waiting downloads count as use, so a rental is not ended as idle while its models are still to come.
+                await Rental.updateOne({ _id: rental.id }, { activeAt: back(31) });
+                await Download.updateMany({ device: rental.device }, { status: 'queued' });
+                await watchRentals({ alone: true });
+                expect((await Rental.findById(rental.id)).state).toBe('running');
+            } finally {
+                for (const job of await Download.find({ device: rental.device })) await downloads.stop(job.id, 'cancel');
+                await downloads.idle();
+                await Download.deleteMany({ device: rental.device });
+            }
+        });
+
         test('a rented computer is its person\'s alone, and is never part of a pool', async () => {
             const { rental } = (await rent()).data;
             await linked(rental);
@@ -10200,7 +10319,8 @@ describe('Online model providers', () => {
 
     test('every suggested service has a secure address, a key page and steps, and every state says what is needed', () => {
         expect(CLOUD_PROVIDERS.length).toBeGreaterThanOrEqual(10);
-        expect(CLOUD_PROVIDERS[0].id).toBe('ollama');
+        // Ollama's own cloud models gave way to Cloud on 2026-11-27, so Ollama is no longer a service to connect.
+        expect(CLOUD_PROVIDERS.some((entry) => entry.id === 'ollama')).toBe(false);
         expect(new Set(CLOUD_PROVIDERS.map((entry) => entry.id)).size).toBe(CLOUD_PROVIDERS.length);
         for (const entry of CLOUD_PROVIDERS) {
             expect(entry.base).toMatch(/^https:\/\/[^/]+/);
@@ -10232,16 +10352,11 @@ describe('Online model providers', () => {
         expect(listed.data.suggested[0].base).toBeUndefined();
     });
 
-    test('Ollama online is asked the way Ollama is asked, and models that only make embeddings are left out', async () => {
-        const { provider } = (await add('ollama')).data;
-        expect(provider.health.state).toBe('healthy');
-        expect(provider.models).toEqual(['kimi-k3']);
-        expect(asked.map((one) => `${one.host}${one.path}`)).toEqual(['ollama.com/api/me', 'ollama.com/api/tags']);
-        expect(asked.every((one) => one.key === 'good-key-0000')).toBe(true);
+    test('Ollama can no longer be connected: Cloud took the place of its cloud models', async () => {
+        expect((await add('ollama')).status).toBe(404);
     });
 
     test('a service that lists its models to anyone is still asked to prove the key, and one that answers a bad key oddly is understood', async () => {
-        expect((await add('ollama', 'bad-key-0000')).data.provider.health.state).toBe('refused');
         expect((await add('openrouter', 'bad-key-0000')).data.provider.health.state).toBe('refused');
         expect(asked.some((one) => one.host === 'openrouter.ai' && one.path === '/api/v1/key')).toBe(true);
         expect((await add('google', 'odd-key-0000')).data.provider.health.state).toBe('refused');
@@ -10672,5 +10787,119 @@ describe('Tools in chats', () => {
         const theirs = await newChat({ tools: [server.id, 'calculator'] });
         await send(theirs.id);
         expect(state.chatCalls[0].tools).toBeUndefined();
+    });
+});
+
+
+describe('Cloud models', () => {
+    const any = { validateStatus: () => true };
+    const kept = {};
+    const asked = [];
+    const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    const stream = (events) => new Response(new ReadableStream({
+        start(controller) {
+            for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${typeof event === 'string' ? event : JSON.stringify(event)}\n\n`));
+            controller.close();
+        }
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    const MODELS = [
+        { model_name: 'zai-org/GLM-5.2', display_name: 'GLM 5.2', supported_context_len: 131072, input_modalities: ['text'], output_modalities: ['text'], tool_call_supported: true, available_for_inference: true, input_token_cost_per_m: 1, output_token_cost_per_m: 2 },
+        { model_name: 'moonshotai/Kimi-K2.5', display_name: 'Kimi K2.5', supported_context_len: 262144, input_modalities: ['text', 'image'], output_modalities: ['text'], tool_call_supported: false, available_for_inference: true, input_token_cost_per_m: 0.5, output_token_cost_per_m: 2.5 },
+        { model_name: 'black-forest-labs/FLUX', input_modalities: ['text'], output_modalities: ['image'], available_for_inference: true, input_token_cost_per_m: 0, output_token_cost_per_m: 0 }
+    ];
+    // Stands in for the Cloud service: a million tokens read and half a million written per answer, priced by the list.
+    const service = async (address, init = {}) => {
+        const url = new URL(address);
+        const body = init.body ? JSON.parse(init.body) : null;
+        const headers = new Headers(init.headers || {});
+        asked.push({ host: url.host, path: url.pathname + url.search, key: headers.get('api_key') || '', bearer: headers.get('authorization') || '', body });
+        if (url.pathname.endsWith('/base_models')) return json({ models: MODELS, status: 'success' });
+        if (url.pathname.endsWith('/chat/completions')) {
+            if (!body.stream) return json({ choices: [{ message: { content: 'A short summary.' } }], usage: { prompt_tokens: 1000, completion_tokens: 100 } });
+            return stream([{ choices: [{ delta: { content: 'Hello from Cloud.' } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }] }, { choices: [], usage: { prompt_tokens: 1000000, completion_tokens: 500000 } }, '[DONE]']);
+        }
+        return json({ error: 'not found' }, 404);
+    };
+    const providers = async () => (await client.get('/api/v1/providers', any)).data;
+    const send = async (chatId) => {
+        const sent = await client.client.post(`/api/v1/chats/${chatId}/messages`, { content: 'Say hello' }, { responseType: 'text', validateStatus: () => true });
+        const text = typeof sent.data === 'string' ? sent.data : JSON.stringify(sent.data);
+        return text.trim().split('\n').map((line) => JSON.parse(line));
+    };
+
+    beforeAll(() => {
+        for (const name of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'HYPERSTACK_API_KEY']) kept[name] = process.env[name];
+        process.env.STRIPE_SECRET_KEY ||= 'sk_test_standin';
+        process.env.STRIPE_WEBHOOK_SECRET ||= 'whsec_standin';
+        process.env.HYPERSTACK_API_KEY = 'studio-key-0000';
+        setCloudFetch(service);
+        forgetCloudList();
+    });
+    afterAll(async () => {
+        for (const [name, value] of Object.entries(kept)) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+        setCloudFetch();
+        forgetCloudList();
+        await Provider.deleteMany({ kind: { $in: ['cloud', 'ollama'] } });
+    });
+    beforeEach(() => { asked.length = 0; });
+
+    test('owners and admins see Cloud with its models and prices; nobody else sees it', async () => {
+        await testStartup.loginAsUser('user');
+        expect((await providers()).providers.some((one) => one.kind === 'cloud')).toBe(false);
+        await testStartup.loginAsUser('admin');
+        const cloud = (await providers()).providers.find((one) => one.kind === 'cloud');
+        expect(cloud).toMatchObject({ name: 'Cloud', cloud: true, health: { state: 'healthy' } });
+        // Image makers are left out; the price is the service's plus the markup, per million tokens.
+        expect(cloud.priced).toEqual([
+            { name: 'zai-org/GLM-5.2', title: 'GLM 5.2', contextLength: 131072, vision: false, tools: true, input: 1.3, output: 2.6 },
+            { name: 'moonshotai/Kimi-K2.5', title: 'Kimi K2.5', contextLength: 262144, vision: true, tools: false, input: 0.65, output: 3.25 }
+        ]);
+        expect(CLOUD_RULES.markup).toBe(0.3);
+        expect(asked[0]).toMatchObject({ host: 'console.hyperstack.cloud', path: '/ai/api/v1/base_models?inference=true', key: 'studio-key-0000', bearer: '' });
+        expect((await providers()).suggested.some((one) => one.id === 'cloud')).toBe(false);
+    });
+
+    test('a chat on a Cloud model is charged from credit for what it read and wrote, and refused once credit runs low', async () => {
+        await testStartup.loginAsUser('admin');
+        const cloud = (await providers()).providers.find((one) => one.kind === 'cloud');
+        const start = (await balanceOf(testStartup.admin.id)).balance;
+        await addCredit(testStartup.admin.id, 1000, { about: 'Cloud test credit' });
+        const chat = (await client.post('/api/v1/chats', { model: 'zai-org/GLM-5.2', device: cloud.id }, any)).data.chat;
+        const events = await send(chat.id);
+        expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('Hello from Cloud.');
+        expect(events.find((event) => event.type === 'done')).toBeTruthy();
+        const call = asked.find((one) => one.path.endsWith('/chat/completions'));
+        expect(call).toMatchObject({ key: 'studio-key-0000', bearer: '' });
+        // A million read at $1.30 and half a million written at $2.60: $2.60 in all.
+        await expect.poll(async () => (await balanceOf(testStartup.admin.id)).balance).toBe(start + 1000 - 260);
+
+        // Less than the least left: refused before anything is asked of the service.
+        await charge(testStartup.admin.id, (await balanceOf(testStartup.admin.id)).balance - (CLOUD_RULES.least - 1), { about: 'Spent elsewhere' });
+        asked.length = 0;
+        const refused = await send(chat.id);
+        expect(refused.find((event) => event.code) || refused[0]).toMatchObject({ code: 'CLOUD_NO_CREDIT' });
+        expect(asked.some((one) => one.path.endsWith('/chat/completions'))).toBe(false);
+    });
+
+    test('a chat on one of Ollama\'s old cloud models moves to the closest Cloud model', async () => {
+        const names = MODELS.map((one) => ({ name: one.model_name }));
+        expect(cloudMatch('kimi-k2.5:cloud', names)).toMatchObject({ name: 'moonshotai/Kimi-K2.5' });
+        expect(cloudMatch('glm-5:cloud', names)).toMatchObject({ name: 'zai-org/GLM-5.2' });
+        expect(cloudMatch('qwen3-coder:480b-cloud', names)).toBeNull();
+
+        await testStartup.loginAsUser('admin');
+        await addCredit(testStartup.admin.id, 1000, { about: 'Cloud test credit' });
+        const old = await Provider.create({ owner: testStartup.admin.id, kind: 'ollama', name: 'Ollama', sealed: seal({ key: 'old-key-0000' }), models: [{ name: 'kimi-k2.5:cloud' }] });
+        const chat = (await client.post('/api/v1/chats', { model: 'kimi-k2.5:cloud', device: String(old._id) }, any)).data.chat;
+        expect((await providers()).providers.some((one) => one.kind === 'ollama')).toBe(false);
+        const events = await send(chat.id);
+        expect(events.find((event) => event.type === 'done')).toBeTruthy();
+        const moved = (await client.get(`/api/v1/chats/${chat.id}`, any)).data.chat;
+        expect(moved.model).toBe('moonshotai/Kimi-K2.5');
+        expect(moved.device).toBe((await Provider.findOne({ owner: testStartup.admin.id, kind: 'cloud' })).id);
+        await old.deleteOne();
     });
 });
