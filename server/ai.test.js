@@ -10864,6 +10864,12 @@ describe('Cloud models', () => {
         expect(CLOUD_RULES.markup).toBe(0.3);
         expect(asked[0]).toMatchObject({ host: 'console.hyperstack.cloud', path: '/ai/api/v1/base_models?inference=true', key: 'studio-key-0000', bearer: '' });
         expect((await providers()).suggested.some((one) => one.id === 'cloud')).toBe(false);
+        // The chat's model picker gets the same prices, and a model that cannot use tools is not said to.
+        const listed = (await client.client.get('/api/v1/models', { headers: { 'X-Mollama-Device': cloud.id }, validateStatus: () => true })).data.models;
+        expect(listed.map((model) => [model.name, model.price, model.capabilities.includes('tools')])).toEqual([
+            ['zai-org/GLM-5.2', { input: 1.3, output: 2.6 }, true],
+            ['moonshotai/Kimi-K2.5', { input: 0.65, output: 3.25 }, false]
+        ]);
     });
 
     test('a chat on a Cloud model is charged from credit for what it read and wrote, and refused once credit runs low', async () => {
@@ -10886,6 +10892,34 @@ describe('Cloud models', () => {
         const refused = await send(chat.id);
         expect(refused.find((event) => event.code) || refused[0]).toMatchObject({ code: 'CLOUD_NO_CREDIT' });
         expect(asked.some((one) => one.path.endsWith('/chat/completions'))).toBe(false);
+    });
+
+    test('Cloud can be turned off and on, and leaves the model picker while it is off or the credit is too low', async () => {
+        await testStartup.loginAsUser('admin');
+        await addCredit(testStartup.admin.id, 1000, { about: 'Cloud test credit' });
+        const inPicker = async () => (await client.get('/api/v1/devices?with=online', any)).data.devices.some((device) => device.kind === 'cloud' && device.name === 'Cloud (online)');
+        let cloud = (await providers()).providers.find((one) => one.kind === 'cloud');
+        expect(cloud).toMatchObject({ on: true, credit: true });
+        expect(await inPicker()).toBe(true);
+
+        const off = await client.put(`/api/v1/providers/${cloud.id}/cloud`, { on: false }, any);
+        expect(off.data.provider).toMatchObject({ on: false });
+        expect(await inPicker()).toBe(false);
+        const chat = (await client.post('/api/v1/chats', { model: 'zai-org/GLM-5.2', device: cloud.id }, any)).data.chat;
+        asked.length = 0;
+        const refused = await send(chat.id);
+        expect(refused.find((event) => event.code) || refused[0]).toMatchObject({ code: 'CLOUD_OFF' });
+        expect(asked.some((one) => one.path.endsWith('/chat/completions'))).toBe(false);
+        expect((await client.put(`/api/v1/providers/${cloud.id}/cloud`, { on: true }, any)).data.provider).toMatchObject({ on: true });
+        expect(await inPicker()).toBe(true);
+
+        // With too little credit Cloud is marked so the Online section hides it, and the picker leaves it out.
+        await charge(testStartup.admin.id, (await balanceOf(testStartup.admin.id)).balance, { about: 'Spent elsewhere' });
+        cloud = (await providers()).providers.find((one) => one.kind === 'cloud');
+        expect(cloud).toMatchObject({ on: true, credit: false });
+        expect(await inPicker()).toBe(false);
+        await testStartup.loginAsUser('user');
+        expect((await client.put(`/api/v1/providers/${cloud.id}/cloud`, { on: false }, any)).status).toBe(404);
     });
 
     test('a chat on one of Ollama\'s old cloud models moves to the closest Cloud model', async () => {
