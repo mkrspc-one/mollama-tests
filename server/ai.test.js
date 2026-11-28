@@ -26,8 +26,8 @@ import {
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
-import { SkillPiece, Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES, searchSkills, indexSkills, setSkillSearch, skillSearchState, SEARCH_MODEL, SEARCH_RULES } from '../../server/controllers/ai.controller.js';
+import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES, searchSkills, indexSkills, setSkillSearch, skillSearchState, writeSkillIndex, loadSkillIndex, SEARCH_MODEL, SEARCH_RULES } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -5045,12 +5045,12 @@ describe('Chat endpoints', () => {
             const pick = (...ids) => ids.map((id) => SKILLS.find((skill) => skill.id === id));
             // The whole library is indexed, as on a running server, so each request has the library's middle to stand out from.
             const indexLibrary = async () => {
-                setSkillSearch({ on: true, embed: standIn, keep: false });
+                setSkillSearch({ on: true, embed: standIn });
                 await indexSkills();
             };
             beforeAll(indexLibrary);
             beforeEach(() => setSkillSearch({ on: true }));
-            afterAll(() => setSkillSearch({ on: false, embed: null, keep: true }));
+            afterAll(() => setSkillSearch({ on: false, embed: null }));
 
             test('finds skills by words and meaning together, says which really match, and falls back to words alone', async () => {
                 const skills = pick('marketing-cold-email', 'anthropic-pptx', 'marketing-copywriting', 'engineering-grilling');
@@ -5065,28 +5065,47 @@ describe('Chat endpoints', () => {
                 expect(words[0].skill.id).toBe('marketing-cold-email');
             });
 
-            test('the library is indexed once: each piece\'s numbers are kept by its text and not worked out again', async () => {
+            test('the library is indexed once into a file the server reads, and a changed piece waits for the next index', async () => {
+                const { default: fs } = await import('node:fs');
+                const { default: os } = await import('node:os');
+                const { default: path } = await import('node:path');
+                const file = path.join(os.tmpdir(), `skill-index-${Date.now()}.bin`);
                 const skills = pick('marketing-cold-email', 'marketing-copywriting');
+                setSkillSearch({ embed: standIn });
+                const written = await writeSkillIndex(file, skills);
+                const size = (await standIn(['x']))[0].length;
+                // Packed, 4 bytes a number, after one line naming the model and the pieces.
+                expect(fs.statSync(file).size).toBe(written.bytes);
+                expect(written.bytes).toBeGreaterThan(written.pieces * size * 4);
+                expect(written.bytes).toBeLessThan(written.pieces * size * 4 + written.pieces * 50 + 200);
+
+                // A server starting (nothing held) reads the numbers and works out only each request's own.
                 let made = 0;
-                setSkillSearch({ embed: async (texts) => { made += texts.length; return standIn(texts); }, keep: true });
-                await SkillPiece.deleteMany({ model: SEARCH_MODEL });
-                const first = await indexSkills(skills);
-                expect(first).toMatchObject({ ready: true });
-                expect(first.done).toBe(first.pieces);
-                expect(await SkillPiece.countDocuments({ model: SEARCH_MODEL })).toBe(first.pieces);
-                // Kept packed, 4 bytes a number, so the whole library stays a few megabytes.
-                const row = await SkillPiece.findOne({ model: SEARCH_MODEL }).lean();
-                expect(row.vector.buffer.byteLength).toBe((await standIn(['x']))[0].length * 4);
-                const madeFirst = made;
-                // A restart (nothing held in memory) reads the kept numbers instead of working them out again.
                 setSkillSearch({ embed: async (texts) => { made += texts.length; return standIn(texts); } });
-                await indexSkills(skills);
-                expect(made).toBe(madeFirst);
+                expect(loadSkillIndex(file, skills)).toMatchObject({ ready: true, pieces: written.pieces, done: written.pieces });
+                await searchSkills(skills, 'help me with outreach to new prospects');
+                expect(made).toBe(1);
                 // Until enough of the library is indexed there is no middle to judge meaning by, so words alone decide.
                 expect((await searchSkills(skills, 'help me with outreach to new prospects')).filter((hit) => hit.matches)).toEqual([]);
-                await SkillPiece.deleteMany({ model: SEARCH_MODEL });
+
+                // A skill whose text changed has no numbers for that piece until the index is made again.
+                const changed = { ...skills[0], description: `${skills[0].description} Changed.` };
+                expect(loadSkillIndex(file, [changed, skills[1]]).done).toBe(written.pieces - 1);
+                // A file made with another model is not read.
+                fs.writeFileSync(file, Buffer.concat([Buffer.from(`${JSON.stringify({ model: 'other', size, hashes: [] })}\n`)]));
+                setSkillSearch({ embed: standIn });
+                expect(loadSkillIndex(file, skills)).toMatchObject({ ready: false });
+                fs.rmSync(file, { force: true });
                 await indexLibrary();
                 expect(skillSearchState()).toMatchObject({ on: true, model: SEARCH_MODEL, ready: true });
+            });
+
+            test('the committed index file covers every piece of the library (after changing a skill, run npm run index-skills)', async () => {
+                setSkillSearch({ embed: standIn });
+                const state = loadSkillIndex();
+                expect(state).toMatchObject({ ready: true });
+                expect(state.done).toBe(state.pieces);
+                await indexLibrary();
             });
 
             test('a model that can use tools is told which of the chat\'s skills match the request; small talk opens none', async () => {
