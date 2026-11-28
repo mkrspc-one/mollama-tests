@@ -26,8 +26,8 @@ import {
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
-import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES } from '../../server/controllers/ai.controller.js';
+import { SkillPiece, Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES, searchSkills, indexSkills, setSkillSearch, skillSearchState, SEARCH_MODEL, SEARCH_RULES } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -5025,6 +5025,110 @@ describe('Chat endpoints', () => {
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
             expect(back.skills).toEqual(['components', 'skill-map', 'richmd-rich-md-first', 'explainer-visual-explainer']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
+        });
+
+        describe('Search before sending', () => {
+            // A stand-in embedding model: words hashed into 4,096 places, so texts sharing words are close in meaning, and a
+            // few words count as the same meaning (outreach, prospect and email; deck and slides) as a real model would.
+            const SAME = { outreach: 'email', prospect: 'email', prospects: 'email', cold: 'email', deck: 'slides', presentation: 'slides', headline: 'copy', sells: 'copy' };
+            const standIn = async (texts) => texts.map((text) => {
+                const vector = new Array(4096).fill(0);
+                for (const raw of String(text).toLowerCase().match(/[a-z]{3,}/g) || []) {
+                    const word = Object.hasOwn(SAME, raw) ? SAME[raw] : raw;
+                    let hash = 0;
+                    for (const letter of word) hash = (hash * 31 + letter.charCodeAt(0)) % 4096;
+                    vector[hash] += 1;
+                }
+                const size = Math.hypot(...vector) || 1;
+                return vector.map((value) => value / size);
+            });
+            const pick = (...ids) => ids.map((id) => SKILLS.find((skill) => skill.id === id));
+            // The whole library is indexed, as on a running server, so each request has the library's middle to stand out from.
+            const indexLibrary = async () => {
+                setSkillSearch({ on: true, embed: standIn, keep: false });
+                await indexSkills();
+            };
+            beforeAll(indexLibrary);
+            beforeEach(() => setSkillSearch({ on: true }));
+            afterAll(() => setSkillSearch({ on: false, embed: null, keep: true }));
+
+            test('finds skills by words and meaning together, says which really match, and falls back to words alone', async () => {
+                const skills = pick('marketing-cold-email', 'anthropic-pptx', 'marketing-copywriting', 'engineering-grilling');
+                const outreach = await searchSkills(skills, 'help me with outreach to new prospects');
+                expect(outreach[0]).toMatchObject({ skill: { id: 'marketing-cold-email' }, matches: true });
+                expect(outreach[0].lift).toBeGreaterThanOrEqual(SEARCH_RULES.lift);
+                // Small talk matches nothing, so nothing is pushed at a model for a greeting.
+                expect((await searchSkills(skills, 'hello there')).filter((hit) => hit.matches)).toEqual([]);
+                // With the embedding model failing, the words alone still rank, so skills always work.
+                setSkillSearch({ embed: async () => { throw new Error('no model'); } });
+                const words = await searchSkills(skills, 'write a cold email');
+                expect(words[0].skill.id).toBe('marketing-cold-email');
+            });
+
+            test('the library is indexed once: each piece\'s numbers are kept by its text and not worked out again', async () => {
+                const skills = pick('marketing-cold-email', 'marketing-copywriting');
+                let made = 0;
+                setSkillSearch({ embed: async (texts) => { made += texts.length; return standIn(texts); }, keep: true });
+                await SkillPiece.deleteMany({ model: SEARCH_MODEL });
+                const first = await indexSkills(skills);
+                expect(first).toMatchObject({ ready: true });
+                expect(first.done).toBe(first.pieces);
+                expect(await SkillPiece.countDocuments({ model: SEARCH_MODEL })).toBe(first.pieces);
+                // Kept packed, 4 bytes a number, so the whole library stays a few megabytes.
+                const row = await SkillPiece.findOne({ model: SEARCH_MODEL }).lean();
+                expect(row.vector.buffer.byteLength).toBe((await standIn(['x']))[0].length * 4);
+                const madeFirst = made;
+                // A restart (nothing held in memory) reads the kept numbers instead of working them out again.
+                setSkillSearch({ embed: async (texts) => { made += texts.length; return standIn(texts); } });
+                await indexSkills(skills);
+                expect(made).toBe(madeFirst);
+                // Until enough of the library is indexed there is no middle to judge meaning by, so words alone decide.
+                expect((await searchSkills(skills, 'help me with outreach to new prospects')).filter((hit) => hit.matches)).toEqual([]);
+                await SkillPiece.deleteMany({ model: SEARCH_MODEL });
+                await indexLibrary();
+                expect(skillSearchState()).toMatchObject({ on: true, model: SEARCH_MODEL, ready: true });
+            });
+
+            test('a model that can use tools is told which of the chat\'s skills match the request; small talk opens none', async () => {
+                const opener = (request) => request.tools.find((tool) => tool.function.name === 'open_skill').function;
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-copywriting', 'engineering-grilling'] });
+                await send(chat.id, { content: 'rewrite my headline copy so it sells' });
+                expect(opener(state.chatCalls[0]).description).toMatch(/These match this request, so open them before you answer: Copywriting\. Open any other only if the request needs it\./);
+                expect(opener(state.chatCalls[0]).description).not.toMatch(/weigh every skill/);
+                // Every skill that is on can still be opened.
+                expect([...opener(state.chatCalls[0]).parameters.properties.skill.enum].sort()).toEqual(['Copywriting', 'Grilling']);
+
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'hello' });
+                expect(opener(state.chatCalls[0]).description).toMatch(/None of them matches this request, so answer without opening one unless the request clearly calls for it\./);
+
+                // With search off, the list is as it was.
+                setSkillSearch({ on: false });
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'rewrite my headline copy so it sells' });
+                expect(opener(state.chatCalls[0]).description).toMatch(/weigh every skill on it against the request/);
+            });
+
+            test('find_skill searches the library by meaning, and a model that cannot use tools gets only the matching skills in full', async () => {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['engineering-grilling'] });
+                state.toolPlan = [[['find_skill', { query: 'outreach to prospects' }]]];
+                await send(chat.id, { content: 'I need to contact new prospects' });
+                const found = state.chatCalls[1].messages.at(-1).content;
+                // Cold Email shares few words with the query, so only meaning brings it up.
+                expect(found).toMatch(/^- Cold Email /m);
+
+                setWordRoom(Infinity);
+                state.noTools = true;
+                state.chatCalls.length = 0;
+                const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-copywriting', 'engineering-grilling'] });
+                await send(plain.id, { content: 'rewrite my headline copy so it sells' });
+                state.noTools = false;
+                setWordRoom();
+                const system = state.chatCalls[0].messages[0].content;
+                expect(system).toContain(SKILLS.find((skill) => skill.id === 'marketing-copywriting').text);
+                expect(system).not.toContain(SKILLS.find((skill) => skill.id === 'engineering-grilling').text);
+                expect(system).toContain('Also turned on, but not needed for this request: Grilling.');
+            });
         });
 
         test('a model that can use tools is handed each skill by name, opens one when it fits, and keeps what it opened', async () => {
