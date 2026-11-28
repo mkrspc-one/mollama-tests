@@ -27,7 +27,7 @@ import {
     poolGroups, connectionProblems, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Training, Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES, searchSkills, indexSkills, setSkillSearch, skillSearchState, writeSkillIndex, loadSkillIndex, SEARCH_MODEL, SEARCH_RULES } from '../../server/controllers/ai.controller.js';
+import { readLessons, trainSettings, trainNeeds, trainUpdates, trainNotes, settingsProblem, TRAIN_SETTINGS, TRAIN_GROUPS, trainBase, trainCandidates, setTrainFetch, TRAIN_BASES, downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, readWordCalls, BUILTIN_TOOLS, waitingPermissions, setPermissionWait, setWordRoom, kitHelp, scriptHelp, kernelHelp, forgetWordy, readTextCalls, fixedColours, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks, stopReplies, recoverReplies, cutInput, conversationMb, skillParts, skillInParts, guideReminder, pagesGiven, nearSkill, promisedOnly, linkSummary, poolScene, setPoolRecheck, poolRoutes, gateAddress, forgetCloudList, cloudMatch, CLOUD_RULES, searchSkills, indexSkills, setSkillSearch, skillSearchState, writeSkillIndex, loadSkillIndex, SEARCH_MODEL, SEARCH_RULES, indexEarlier } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -4845,8 +4845,9 @@ describe('Chat endpoints', () => {
                 expect(skill.credit).toMatch(/\((MIT|Apache-2\.0|MIT, Apache-2\.0)\)$/);
                 expect(skill.text.startsWith(`SKILL: ${skill.name}`)).toBe(true);
             }
-            // Mollama's own skills: the one that draws its viewers and the map of what each skill is for.
-            expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components', 'skill-map']);
+            // Mollama's own skills: the one that draws its viewers and the map of what each skill is for, then the Arena
+            // Master skill the Arena's master model reads.
+            expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components', 'skill-map', 'mollama-arena-master']);
             expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer', 'cadsmith', 'caveman']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
@@ -4974,9 +4975,10 @@ describe('Chat endpoints', () => {
             for (const gone of ['assistant.md', 'search.md', 'tools.md', 'skills', 'components']) {
                 expect(fs.existsSync(new URL(`../../server/instructions/${gone}`, import.meta.url))).toBe(false);
             }
-            // Mollama's own two skills are in the library like every other. The component pages beside the Components
-            // page are opened as components, not as files of a skill, and no page is taken for a skill of its own.
-            expect(SKILLS.filter((skill) => skill.source === 'mollama').map((skill) => [skill.id, skill.files.length])).toEqual([['components', 0], ['skill-map', 6]]);
+            // Mollama's own two skills are in the library like every other, beside the Arena Master skill the Arena's master
+            // model reads. The component pages beside the Components page are opened as components, not as files of a
+            // skill, and no page is taken for a skill of its own.
+            expect(SKILLS.filter((skill) => skill.source === 'mollama').map((skill) => [skill.id, skill.files.length])).toEqual([['components', 0], ['skill-map', 6], ['mollama-arena-master', 0]]);
             expect(COMPONENT_PAGES.map((page) => page.name)).toEqual(expect.arrayContaining(['Audio', 'Frame', 'Video']));
             expect(COMPONENT_PAGES.map((page) => page.name)).not.toContain('components');
             expect(SKILLS.map((skill) => skill.id)).not.toEqual(expect.arrayContaining(['Frame']));
@@ -5147,6 +5149,59 @@ describe('Chat endpoints', () => {
                 expect(system).toContain(SKILLS.find((skill) => skill.id === 'marketing-copywriting').text);
                 expect(system).not.toContain(SKILLS.find((skill) => skill.id === 'engineering-grilling').text);
                 expect(system).toContain('Also turned on, but not needed for this request: Grilling.');
+            });
+
+            test('a long chat\'s folded messages are searched: what bears on a request goes with the memory word for word, and find_earlier reads them', async () => {
+                const topics = ['weather', 'music', 'sport', 'travel', 'cooking'];
+                const earlier = Array.from({ length: 20 }, (_, n) => ({
+                    role: n % 2 === 0 ? 'user' : 'assistant',
+                    content: n === 6 ? 'The kitchen is 3.4 m by 2.8 m and the budget is 14500 euros.' : `Number ${n}: a few words about ${topics[n % 5]}, nothing else.`,
+                    model: 'qwen2.5-coder:7b'
+                }));
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await Chat.updateOne({ _id: chat.id }, { $set: { messages: earlier, memory: '- The user is redoing a kitchen.', memoryThrough: 18 } });
+
+                // The folded messages' numbers are worked out after a reply and kept on the chat, one byte a number, never
+                // loaded with it.
+                await indexEarlier(chat.id);
+                const held = await Chat.findById(chat.id).select('recall');
+                expect(held.recall).toHaveLength(18);
+                expect(held.recall[0].numbers.length).toBe((await standIn(['x']))[0].length);
+                expect((await Chat.findById(chat.id)).recall).toBeUndefined();
+
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'What was the kitchen budget in euros?' });
+                const system = state.chatCalls[0].messages[0].content;
+                expect(system).toContain('Memory of the earlier part of this conversation (those messages are not repeated below):\n- The user is redoing a kitchen.\n\nPassages from those earlier messages that bear on the newest message, word for word:\n[Message 7, from the user]\nThe kitchen is 3.4 m by 2.8 m and the budget is 14500 euros.');
+                expect(system).not.toContain('Number 2:');
+                const finder = state.chatCalls[0].tools.find((tool) => tool.function.name === 'find_earlier');
+                expect(finder.function.description).toContain('Messages 1 to 18 are folded into the memory');
+                // Small talk brings nothing back.
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'hello' });
+                expect(state.chatCalls[0].messages[0].content).not.toContain('Passages from those earlier messages');
+
+                // A model can look itself: passages by their message number, a whole message, and only folded ones.
+                state.chatCalls.length = 0;
+                state.toolPlan = [[['find_earlier', { query: 'the kitchen budget in euros' }]], [['find_earlier', { message: 7 }]], [['find_earlier', { message: 19 }]]];
+                const { events } = await send(chat.id, { content: 'what did I say earlier?' });
+                expect(events.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['Earlier messages', 'Earlier messages', 'Earlier messages']);
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^\[Message 7, from the user\]\nThe kitchen is 3\.4 m by 2\.8 m/);
+                expect(state.chatCalls[2].messages.at(-1).content).toBe('[Message 7, from the user]\nThe kitchen is 3.4 m by 2.8 m and the budget is 14500 euros.');
+                expect(state.chatCalls[3].messages.at(-1).content).toMatch(/^Message 19 is not one of the folded messages \(1 to 18\)/);
+
+                // With search off (SKILL_SEARCH=off) the chat is as it was: nothing sent ahead and no such function.
+                setSkillSearch({ on: false });
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'What was the kitchen budget in euros?' });
+                expect(state.chatCalls[0].messages[0].content).not.toContain('Passages from those earlier messages');
+                expect(state.chatCalls.flatMap((call) => call.tools || []).some((tool) => tool.function.name === 'find_earlier')).toBe(false);
+                setSkillSearch({ on: true });
+
+                // A chat with nothing folded has no such function.
+                state.chatCalls.length = 0;
+                await send((await newChat({ model: 'qwen2.5-coder:7b' })).id, { content: 'How big is the kitchen?' });
+                expect(state.chatCalls.flatMap((call) => call.tools || []).some((tool) => tool.function.name === 'find_earlier')).toBe(false);
             });
         });
 
